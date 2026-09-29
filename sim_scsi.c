@@ -1318,20 +1318,24 @@ scsi_status (bus, STS_OK, KEY_OK, ASC_OK);              /* GOOD status */
 
    The CD-ROM commands report addresses either as a logical block address
    or, when the MSF bit is set, as minutes/seconds/frames.  MSF
-   addresses count physical 2048 byte sectors from the start of the disc, and
-   logical block address 0 is at 00/02/00 (SCSI-2, 14.1.5) -- so
-   the frame count is offset by 150.  The logical block size a unit presents
-   may differ from the physical one (an RRD42 presents 512 byte blocks), so a
-   logical block count is converted to physical sectors first. */
+   addresses count physical 2048 byte sectors.  An absolute address counts
+   from the start of the disc, where logical block address 0 is at 00/02/00
+   (SCSI-2, 14.1.5), so its frame count is offset by 150; a track relative
+   address counts from the start of the track and is not.  The logical block
+   size a unit presents may differ from the physical one (an RRD42 presents
+   512 byte blocks), so a logical block count is converted to physical
+   sectors first. */
 
-static void scsi_cd_address (SCSI_BUS *bus, uint32 pos, t_bool msf)
+static void scsi_cd_address (SCSI_BUS *bus, uint32 pos, t_bool msf, t_bool absolute)
 {
 UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 uint32 frames;
 
 if (msf) {
-    frames = (uint32)(((t_uint64)pos * dev->block_size) / CD_SECTSIZE) + CD_MSF_OFFSET;
+    frames = (uint32)(((t_uint64)pos * dev->block_size) / CD_SECTSIZE);
+    if (absolute)
+        frames += CD_MSF_OFFSET;
     bus->buf[bus->buf_b++] = 0;                         /* reserved */
     bus->buf[bus->buf_b++] = (uint8)(frames / (60 * 75)); /* minutes */
     bus->buf[bus->buf_b++] = (uint8)((frames / 75) % 60); /* seconds */
@@ -1389,8 +1393,8 @@ if (subq) {
             bus->buf[bus->buf_b++] = CD_CTL_DATA;       /* ADR, control */
             bus->buf[bus->buf_b++] = 1;                 /* track number */
             bus->buf[bus->buf_b++] = 1;                 /* index number */
-            scsi_cd_address (bus, 0, msf);              /* absolute address */
-            scsi_cd_address (bus, 0, msf);              /* track relative address */
+            scsi_cd_address (bus, 0, msf, TRUE);        /* absolute address */
+            scsi_cd_address (bus, 0, msf, FALSE);       /* track relative address */
             if (fmt == 0) {                             /* format 0 adds the identification data */
                 memset (&bus->buf[bus->buf_b], 0, 32);  /* MCVal and TCVal clear: no MCN, no ISRC */
                 bus->buf_b += 32;
