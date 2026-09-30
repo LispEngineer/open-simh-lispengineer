@@ -18,11 +18,11 @@ Build it exactly as Open SIMH, for example:
 | KA46: memory controller registers listed before the option ROM window (MEMERR read as all ones; a memory parity error logged every minute) | `VAX/vax440_sysdev.c` | #586 |
 | LANCE (XS): raise a pending interrupt when the driver sets CSR0<INEA> again (lost interrupts, stalled transfers) | `VAX/vax_xs.c` | #587 |
 | LANCE (XS): report a failed transmit in the descriptor, not as CSR0<BABL> (an unattached LANCE made OpenVMS bugcheck) | `VAX/vax_xs.c` | #588 |
-| SCSI: report disk I/O errors instead of transferring unset data | `sim_scsi.c` | not yet submitted |
-| SCSI: bound data transfers by the buffer size | `sim_scsi.c` | not yet submitted |
-| SCSI: report write protection (MODE SENSE) and enforce it, including `SET <unit> LOCKED` on an attached unit | `sim_scsi.c` | not yet submitted |
-| SCSI CD-ROM: implement READ SUB-CHANNEL (0x42), all four formats | `sim_scsi.c` | not yet submitted |
-| DISK: `sim_disk_rdsect()` sets the returned sector count on every path (with the two SCSI fixes above, `SET <unit> FORMAT=AUTO` on an attached unit no longer crashes the simulator) | `sim_disk.c` | not yet submitted |
+| SCSI: report disk I/O errors instead of transferring unset data | `sim_scsi.c` | #589 |
+| SCSI: bound data transfers by the buffer size | `sim_scsi.c` | #590 |
+| SCSI: report write protection (MODE SENSE) and enforce it, including `SET <unit> LOCKED` on an attached unit | `sim_scsi.c` | #591 |
+| SCSI CD-ROM: implement READ SUB-CHANNEL (0x42), all four formats | `sim_scsi.c` | #592 |
+| DISK: `sim_disk_rdsect()` sets the returned sector count on every path (with the two SCSI fixes above, `SET <unit> FORMAT=AUTO` on an attached unit no longer crashes the simulator) | `sim_disk.c` | #593 |
 
-This file is updated each time the branch moves; the PR column is filled in as each pull
-request is opened.
+This file is updated each time the branch moves. Related Open SIMH issue: #594 (`SET <unit>
+FORMAT=` on an attached unit).
