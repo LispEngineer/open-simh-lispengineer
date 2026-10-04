@@ -795,10 +795,14 @@ else {
 rtc = &rtcs[tmr];
 /*
  * If we'd previously succeeded in calibrating a tick value, then use that
- * delay as a better default to setup when we're re-initialized.
- * Re-initializing happens on any boot.
+ * delay as a better default when the running program re-initializes its
+ * clock (an I/O reset, re-arming the clock): its instruction rate has not
+ * changed.  A re-initialization while stopped (a BOOT or RESET command)
+ * starts a new program, such as a console ROM whose instruction rate may
+ * be far below the last calibration, so it starts from the caller's
+ * initial value, as it does at simulator startup.
  */
-if (rtc->currd)
+if (rtc->currd && sim_is_running)
     time = rtc->currd;
 if (!uptr)
     uptr = rtc->clock_unit;
