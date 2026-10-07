@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-09-30)
+## Fixes carried (reviewed 2026-10-07)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -24,6 +24,8 @@ Build it exactly as Open SIMH, for example:
 | SCSI CD-ROM: implement READ SUB-CHANNEL (0x42), all four formats | `sim_scsi.c` | #592 |
 | DISK: `sim_disk_rdsect()` sets the returned sector count on every path (with the two SCSI fixes above, `SET <unit> FORMAT=AUTO` on an attached unit no longer crashes the simulator) | `sim_disk.c` | #593 |
 | TIMER: bound what `sim_idle()` credits for a long or negative sleep (with idling enabled, a host pause of 10 s or more, or a step of the host clock, left the simulator sleeping seconds to minutes per clock tick) | `sim_timer.c` | #596 |
+| TIMER: at the console, start a re-initialized clock from the lower of its initial value and the last calibration (`BOOT CPU` after a stop made the MicroVAX 3900 ROM's power-on tests take minutes, with `?53` errors) | `sim_timer.c` | #598 |
+| TIMER: measure the calibrated rate over the time the simulator ran (after a short host stall the guest clock ran up to 2.6 s ahead; needs #596) | `sim_timer.c` | #599 |
 
 This file is updated each time the branch moves. Related Open SIMH issues: #594 (`SET <unit>
 FORMAT=` on an attached unit); #597 (`SET CLOCK ASYNCH` with idling enabled crashes the
