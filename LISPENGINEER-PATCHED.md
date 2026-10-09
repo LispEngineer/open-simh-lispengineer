@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-07)
+## Fixes carried (reviewed 2026-10-08)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -26,6 +26,7 @@ Build it exactly as Open SIMH, for example:
 | TIMER: bound what `sim_idle()` credits for a long or negative sleep (with idling enabled, a host pause of 10 s or more, or a step of the host clock, left the simulator sleeping seconds to minutes per clock tick) | `sim_timer.c` | #596 |
 | TIMER: at the console, start a re-initialized clock from the lower of its initial value and the last calibration (`BOOT CPU` after a stop made the MicroVAX 3900 ROM's power-on tests take minutes, with `?53` errors) | `sim_timer.c` | #598 |
 | TIMER: measure the calibrated rate over the time the simulator ran (after a short host stall the guest clock ran up to 2.6 s ahead; needs #596) | `sim_timer.c` | #599 |
+| TIMER: keep catch-up ticks on after a stop at the `sim>` prompt (the first stop switched them off for the rest of the process, so later stalls were repaid at only 1 s per second, and that stop cost a MicroVAX 3900 guest 1.0-1.6 s) | `sim_timer.c` | #602 |
 
 This file is updated each time the branch moves. Related Open SIMH issues: #594 (`SET <unit>
 FORMAT=` on an attached unit); #597 (`SET CLOCK ASYNCH` with idling enabled crashes the
