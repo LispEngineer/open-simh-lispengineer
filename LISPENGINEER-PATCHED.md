@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-08)
+## Fixes carried (reviewed 2026-10-09)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -27,6 +27,45 @@ Build it exactly as Open SIMH, for example:
 | TIMER: at the console, start a re-initialized clock from the lower of its initial value and the last calibration (`BOOT CPU` after a stop made the MicroVAX 3900 ROM's power-on tests take minutes, with `?53` errors) | `sim_timer.c` | #598 |
 | TIMER: measure the calibrated rate over the time the simulator ran (after a short host stall the guest clock ran up to 2.6 s ahead; needs #596) | `sim_timer.c` | #599 |
 | TIMER: keep catch-up ticks on after a stop at the `sim>` prompt (the first stop switched them off for the rest of the process, so later stalls were repaid at only 1 s per second, and that stop cost a MicroVAX 3900 guest 1.0-1.6 s) | `sim_timer.c` | #602 |
+| TIMER: the guest clock follows elapsed time (`SET CLOCK ELAPSED`, default here; `NOELAPSED` restores Open SIMH) | `sim_timer.c`, `scp.c`, `sim_timer.h`, seven VAX files | #603 (**behaviour change**, see "Behaviour that differs from Open SIMH") |
+
+## Behaviour that differs from Open SIMH
+
+### The guest clock follows elapsed time (SET CLOCK ELAPSED, the default here)
+
+Open SIMH measures a simulated clock against the host's wall clock.
+A step of that clock (NTP, a manual change) is taken for lost time,
+or for time running backwards; a pause of the simulator over 30
+seconds -- a host suspend, a long stall, a debugger -- is forgiven,
+so the guest ends up behind by the whole pause (hours after a laptop
+suspend); and time spent at the sim> prompt is always forgiven.
+
+This branch measures the clock with the host's elapsed clock, which
+keeps counting during a host suspend and is not moved by steps of the
+wall clock (Linux CLOCK_BOOTTIME, macOS CLOCK_MONOTONIC, Windows
+interrupt time). On simulators with catch-up ticks -- the VAX
+families -- a gap of any length, including a stop at sim> followed by
+CONTINUE, is repaid as a burst of clock ticks that must finish within
+30 seconds (the rest is dropped). The simulator prints
+"Clock catch-up: N ms owed" and "Clock catch-up complete (dropped N
+ms)" on stdout around each catch-up of more than a second, and a
+guest that sets its own time-of-year clock (SET TIME, an NTP step)
+ends a catch-up still under way. Other simulators get the elapsed
+clock but keep Open SIMH's rule for long gaps. SHOW CLOCKS prints the
+time base and how much is still owed.
+
+The time of day a guest reads from its time-of-year clock (TODR,
+watch chip) is still the host's wall clock: a step of the host clock
+is ignored by a running guest and seen at its next boot.
+
+Why: guests on laptops and loaded hosts came back hours behind after
+a suspend, beyond what their NTP will correct, and a host NTP step
+moved guests that keep their own time.
+
+To get Open SIMH's timekeeping behaviour (with this branch's bug
+fixes still in effect): SET CLOCK NOELAPSED.
+Offered to Open SIMH as pull request #603 (with NOELAPSED as its
+default); the default is carried here for good.
 
 This file is updated each time the branch moves. Related Open SIMH issues: #594 (`SET <unit>
 FORMAT=` on an attached unit); #597 (`SET CLOCK ASYNCH` with idling enabled crashes the
