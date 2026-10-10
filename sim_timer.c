@@ -254,7 +254,7 @@ static t_bool sim_catchup_ticks = TRUE;
 /* not run (a long pause, a host suspend, a stop at the sim> prompt) and   */
 /* repays it.  SET CLOCK NOELAPSED: the wall clock, and such time is       */
 /* forgiven.                                                               */
-static t_bool sim_timer_elapsed = FALSE;
+static t_bool sim_timer_elapsed = TRUE;            /* lispengineer-patched: ELAPSED by default */
 #define SIM_CATCHUP_ANNOUNCE    1.0         /* a catch-up of more secs is announced */
 #define SIM_CATCHUP_LIMIT       30.0        /* and must end within these secs */
 #if defined (SIM_ASYNCH_CLOCKS) && !defined (SIM_ASYNCH_IO)
