@@ -456,6 +456,7 @@ switch ((pa >> 2) & 03) {                               /* case on PA<2:1> */
                     dz_char[line] = dz_char[line] | RBUF_FRME;
                 dz_csr &= ~CSR_TRDY;
                 sim_debug(DBG_REG, &dz_dev, "maint char for line %d : %X\n", line, dz_char[line]);
+                sim_activate_abs (&dz_unit[0], dz_unit[1].wait); /* received a char time later */
                 break;
                 }
             sim_activate (&dz_unit[1], 0);
@@ -577,7 +578,11 @@ if (dz_csr & CSR_MSE) {                                 /* enabled? */
         if (dz_scnt >= DZ_SILO_ALM)
             break;
         c = 0;
-        if ((dz_func[line] == DZ_TMXR) && ((dz_csr & CSR_MAINT) == 0)) {
+        if (dz_csr & CSR_MAINT) {                       /* maintenance loopback? */
+            c = dz_char[line];                          /* char written to TDR */
+            dz_char[line] = 0;
+            }
+        else if (dz_func[line] == DZ_TMXR) {
             lp = &dz_ldsc[line];                        /* get line desc */
             c = tmxr_getc_ln (lp);                      /* test for input */
             if (c & SCPE_BREAK)                         /* break? frame err */
