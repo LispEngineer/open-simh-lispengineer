@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-09)
+## Fixes carried (reviewed 2026-10-11)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -28,6 +28,9 @@ Build it exactly as Open SIMH, for example:
 | TIMER: measure the calibrated rate over the time the simulator ran (after a short host stall the guest clock ran up to 2.6 s ahead; needs #596) | `sim_timer.c` | #599 |
 | TIMER: keep catch-up ticks on after a stop at the `sim>` prompt (the first stop switched them off for the rest of the process, so later stalls were repaid at only 1 s per second, and that stop cost a MicroVAX 3900 guest 1.0-1.6 s) | `sim_timer.c` | #602 |
 | TIMER: the guest clock follows elapsed time (`SET CLOCK ELAPSED`, default here; `NOELAPSED` restores Open SIMH) | `sim_timer.c`, `scp.c`, `sim_timer.h`, seven VAX files | #603 (**behaviour change**, see "Behaviour that differs from Open SIMH") |
+| SLIRP: never loop for ever choosing the NAT doorbell port (`ATTACH ... NAT:` looped printing `bind error 13` when the clock drew a privileged port, and on a port already in use) | `slirp_glue/sim_slirp.c` | #604 |
+| SCP: end the simulator cleanly on SIGTERM or SIGHUP at the command level (at `sim>` the signal killed SIMH without writing NVRAM or flushing logs) | `scp.c` | #605 |
+| SCP: flush the console log before waiting for a command (the log lacked the stop message and later command output while at `sim>`) | `scp.c` | #606 |
 
 ## Behaviour that differs from Open SIMH
 
