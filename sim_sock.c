@@ -1013,6 +1013,7 @@ char host[CBUFSIZE], port[CBUFSIZE];
 int r;
 struct addrinfo hints;
 struct addrinfo *result = NULL, *preferred;
+int fallback = 0;
 
 r = sim_parse_addr (hostport, host, sizeof(host), NULL, port, sizeof(port), NULL, NULL);
 if (parse_status)
@@ -1057,10 +1058,21 @@ if (newsock == INVALID_SOCKET) {                        /* socket error? */
         goto retry;
         }
 #else
-    if ((preferred->ai_family == AF_INET6) &&
-        (preferred != result)) {
-        preferred = result;
-        goto retry;
+    /*
+        The host may lack the preferred address family (no IPv6, or a
+        process confined to IPv6): try the first address of the other
+        family, once.
+    */
+    if (!fallback) {
+        int family = preferred->ai_family;
+
+        fallback = 1;
+        for (preferred = result; preferred != NULL; preferred = preferred->ai_next) {
+            if (preferred->ai_family != family)
+                break;
+            }
+        if (preferred != NULL)
+            goto retry;
         }
 #endif
     p_freeaddrinfo(result);
