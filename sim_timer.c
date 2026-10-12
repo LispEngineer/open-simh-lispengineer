@@ -894,17 +894,26 @@ return sim_timer_elapsed && sim_catchup_ticks && rtc->clock_catchup_eligible;
 /* be up to date, and so is the virtual time of its calibration.  The gap   */
 /* may lie inside the current calibration second (rtime is when it began),  */
 /* so vtime is set to what the coming calibration will find on time: now,   */
-/* less the ticks of this second already delivered.  Returns the secs       */
+/* less the ticks of this second already delivered.  At the sim> prompt     */
+/* "now" is when execution stopped: CONTINUE adds the time at the prompt to */
+/* rtime, vtime and the catch-up reference of a clock that no longer owes   */
+/* it, so dropping it here as well would count it twice.  Returns the secs  */
 /* dropped.                                                                 */
 
 static double _rtcn_catchup_drop (RTC *rtc, double tnow)
 {
-double owed = tnow - (rtc->clock_catchup_base_time + rtc->calib_tick_time);
+uint32 msec = _sim_timer_msec ();
+double owed;
 
+if (!sim_is_running) {                              /* at the sim> prompt? */
+    tnow -= ((double)(msec - sim_stop_time)) / 1000.0;
+    msec = sim_stop_time;
+    }
+owed = tnow - (rtc->clock_catchup_base_time + rtc->calib_tick_time);
 if (owed <= 0.0)
     return 0.0;
 rtc->calib_tick_time += owed;
-rtc->vtime = _sim_timer_msec () - ((rtc->hz != 0) ? (rtc->ticks * 1000) / rtc->hz : 0);
+rtc->vtime = msec - ((rtc->hz != 0) ? (rtc->ticks * 1000) / rtc->hz : 0);
 rtc->clock_catchup_dropped += owed;
 ++rtc->clock_catchup_drops;
 return owed;
