@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-11)
+## Fixes carried (reviewed 2026-10-12)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -31,6 +31,14 @@ Build it exactly as Open SIMH, for example:
 | SLIRP: never loop for ever choosing the NAT doorbell port (`ATTACH ... NAT:` looped printing `bind error 13` when the clock drew a privileged port, and on a port already in use) | `slirp_glue/sim_slirp.c` | #604 |
 | SCP: end the simulator cleanly on SIGTERM or SIGHUP at the command level (at `sim>` the signal killed SIMH without writing NVRAM or flushing logs) | `scp.c` | #605 |
 | SCP: flush the console log before waiting for a command (the log lacked the stop message and later command output while at `sim>`) | `scp.c` | #606 |
+| VAX440: map the whole network address ROM (the KA46 power-on NI test failed subtest B) | `VAX/vax440_sysdev.c` | #607 |
+| VAX440: the invalidate filter holds 16 bits per entry (a KA46 power-on test failed) | `VAX/vax440_sysdev.c` | #608 |
+| VAX4XX: DZ maintenance loopback, and the KA46's per-line parameter registers (the power-on DZ test failed) | `VAX/vax4xx_dz.c` and VAX440 files | #609 |
+| VAX440: make the KA46 diagnostic timer count time (the power-on IT test failed) | `VAX/vax440_sysdev.c` | #610 |
+| VAX440: present the secondary cache controller as revision B, as the real VAXstation 4000/60 reads it (the power-on CACHE test failed; OpenVMS now enables the cache) | `VAX/vax440_sysdev.c` | #611 |
+| VAX: make the RZUSER disk type a fixed disk (an RZUSER unit was listed as removable) | `VAX/vax_rzdev.h` | #612 |
+| TIMER: keep the servo's virtual time in step during catch-up seconds (a stop at `sim>`, or `SET CLOCK NOCATCHUP`, cost the guest about a second) | `sim_timer.c` | #613 |
+| TIMER: a catch-up dropped at `sim>` no longer counts the stop twice (with `SET CLOCK ELAPSED`) | `sim_timer.c` | on this fork only for now; offered after #603 |
 
 ## Behaviour that differs from Open SIMH
 
