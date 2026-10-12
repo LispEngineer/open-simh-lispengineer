@@ -894,17 +894,26 @@ return sim_timer_elapsed && sim_catchup_ticks && rtc->clock_catchup_eligible;
 /* be up to date, and so is the virtual time of its calibration.  The gap   */
 /* may lie inside the current calibration second (rtime is when it began),  */
 /* so vtime is set to what the coming calibration will find on time: now,   */
-/* less the ticks of this second already delivered.  Returns the secs       */
+/* less the ticks of this second already delivered.  At the sim> prompt     */
+/* "now" is when execution stopped: CONTINUE adds the time at the prompt to */
+/* rtime, vtime and the catch-up reference of a clock that no longer owes   */
+/* it, so dropping it here as well would count it twice.  Returns the secs  */
 /* dropped.                                                                 */
 
 static double _rtcn_catchup_drop (RTC *rtc, double tnow)
 {
-double owed = tnow - (rtc->clock_catchup_base_time + rtc->calib_tick_time);
+uint32 msec = _sim_timer_msec ();
+double owed;
 
+if (!sim_is_running) {                              /* at the sim> prompt? */
+    tnow -= ((double)(msec - sim_stop_time)) / 1000.0;
+    msec = sim_stop_time;
+    }
+owed = tnow - (rtc->clock_catchup_base_time + rtc->calib_tick_time);
 if (owed <= 0.0)
     return 0.0;
 rtc->calib_tick_time += owed;
-rtc->vtime = _sim_timer_msec () - ((rtc->hz != 0) ? (rtc->ticks * 1000) / rtc->hz : 0);
+rtc->vtime = msec - ((rtc->hz != 0) ? (rtc->ticks * 1000) / rtc->hz : 0);
 rtc->clock_catchup_dropped += owed;
 ++rtc->clock_catchup_drops;
 return owed;
@@ -1254,8 +1263,18 @@ if (sim_asynch_timer || (catchup_ticks_curr > 0)) {
         }
     rtc->based = rtc->currd = new_currd;
     rtc->gtime = new_gtime;                     /* save instruction time */
-    sim_debug (DBG_CAL, &sim_timer_dev, "sim_rtcn_calb(%s tmr=%d, tickper=%d) catchups=%u, idle=%d%% result: %d (delta_rtime=%u, gaps=%u, gap=%u, run=%u)\n",
-                    sim_asynch_timer ? "asynch" : "catchup", tmr, ticksper, catchup_ticks_curr, last_idle_pct, rtc->currd, delta_rtime, gap_count, gap_rtime, run_rtime);
+    /* The servo below measures the clock against vtime, which a second  */
+    /* with catch-up ticks does not use: those ticks keep the clock where */
+    /* the catch-up reference time says it should be.  Keep vtime there  */
+    /* too, and the servo's interval at a nominal second (currd is based */
+    /* here), so that a later second without catch-up ticks starts from  */
+    /* where the clock stands, not from a lead it had before catch-up    */
+    /* ticks began or from the correction of an earlier such second.     */
+    rtc->nxintv = 1000;
+    if (rtc->clock_catchup_eligible)
+        rtc->vtime = rtc->rtime - (uint32)((int32)floor (1000.0 * (_sim_timer_now () - (rtc->clock_catchup_base_time + rtc->calib_tick_time))));
+    sim_debug (DBG_CAL, &sim_timer_dev, "sim_rtcn_calb(%s tmr=%d, tickper=%d) catchups=%u, idle=%d%% result: %d (delta_rtime=%u, gaps=%u, gap=%u, run=%u, vtime-rtime=%d)\n",
+                    sim_asynch_timer ? "asynch" : "catchup", tmr, ticksper, catchup_ticks_curr, last_idle_pct, rtc->currd, delta_rtime, gap_count, gap_rtime, run_rtime, (int)(rtc->vtime - rtc->rtime));
     return rtc->currd;                          /* calibrated result */
     }
 rtc->gtime = new_gtime;                         /* save instruction time */

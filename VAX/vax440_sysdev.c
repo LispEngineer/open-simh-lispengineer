@@ -148,7 +148,6 @@ int32 SCCR = 0;                                         /* secondary cache contr
 int32 sys_model = 0;                                    /* MicroVAX or VAXstation */
 int32 int_req[IPL_HLVL] = { 0 };                        /* interrupt requests */
 int32 int_mask = 0;                                     /* interrupt mask */
-uint32 tmr_tir = 0;                                     /* curr interval */
 
 t_stat sysd_reset (DEVICE *dptr);
 const char *sysd_description (DEVICE *dptr);
@@ -584,7 +583,7 @@ return;
 int32 invfl_rd (int32 pa)
 {
 int32 rg = (pa - 0x20200000) >> 2;
-return invfl[rg];
+return invfl[rg] & 0xFFFF;                              /* 16 bits per entry */
 }
 
 void invfl_wr (int32 pa, int32 val, int32 lnt)
@@ -617,13 +616,13 @@ else cache2ds[rg] = val;
 
 int32 cache2ts_rd (int32 pa)
 {
-int32 rg = (pa - 0x22000000) >> 2;
+int32 rg = (pa - 0x2D000000) >> 2;
 return cache2ts[rg];
 }
 
 void cache2ts_wr (int32 pa, int32 val, int32 lnt)
 {
-int32 rg = (pa - 0x22000000) >> 2;
+int32 rg = (pa - 0x2D000000) >> 2;
 if (lnt < L_LONG) {                                     /* byte or word? */
     int32 sc = (pa & 3) << 3;                           /* merge */
     int32 mask = (lnt == L_WORD)? 0xFFFF: 0xFF;
@@ -647,7 +646,7 @@ WriteL (ka_mapbase + rg, val);
 
 int32 sccr_rd (int32 pa)
 {
-return SCCR & SCCR_RD;
+return (SCCR & SCCR_RD) | SCCR_REV;                    /* DC7203 revision B */
 }
 
 void sccr_wr (int32 pa, int32 val, int32 lnt)
@@ -743,7 +742,7 @@ struct reglink regtable[] = {
     { 0x23000000, 0x23000004, &sccr_rd, &sccr_wr },
     { 0x36800000, 0x36800004, &null_rd, &null_wr },     /* Turbo CSR */
     { 0x08000000, 0x08040000, &cache2ds_rd, &cache2ds_wr },  /* Cache second data store */
-    { 0x22000000, 0x22040000, &cache2ts_rd, &cache2ts_wr },  /* Cache second tag store - should be at 0x2D000000? */
+    { 0x2D000000, 0x2D040000, &cache2ts_rd, &cache2ts_wr },  /* Cache second tag store (DC7203 rev B) */
     { 0x20101A00, 0x20102000, NULL, &null_wr },         /* invalidate single - check size */
     { ROMBASE, ROMBASE+ROMSIZE, &rom_rd, NULL },
     { NVRBASE, NVRBASE+NVRSIZE, &nvr_rd, &nvr_wr },
@@ -828,6 +827,66 @@ WriteReg (pa & ~03, dat, L_LONG);
 return;
 }
 
+/* KA460 diagnostic timer (DIAGTIMU and DIAGTIMM, one longword at 2008001C)
+
+   A free-running count of microseconds in <9:0>, whose carry counts
+   milliseconds in <31:16>.  A write clears the half written; a longword
+   write clears both.  It advances by the instructions executed since it
+   was last accessed, converted to microseconds at one of two rates:
+
+   - read by the console ROM, at the rate the clock is calibrated to, so
+     that the ROM's power-on test of the interval timer, which counts clock
+     ticks during a wait timed by this register, sees the two agree;
+   - read by anything else, at a nominal rate of the KA46's own order,
+     because the primary bootstrap (VMB) calibrates a delay loop with it:
+     it runs 100,000 SOBGTRs and divides by the milliseconds counted less
+     one, which is zero -- a divide-by-zero trap, "?4F SCBINT" -- on a
+     host that executes them in under 2 ms of calibrated time.
+
+   It is accumulated access by access, so that a change in the calibrated
+   rate never moves it backwards.  */
+
+#define DIAG_TMR_IPUS   10.0                            /* nominal instructions/usec */
+
+static uint32 diag_tmr_us = 0;                          /* count, usec */
+static double diag_tmr_frac = 0.0;                      /* fraction of a usec */
+static double diag_tmr_last = 0.0;                      /* sim_gtime of last update */
+
+static void diag_tmr_update (void)
+{
+double now = sim_gtime ();
+double ips = sim_timer_inst_per_sec ();
+double us;
+
+if (!ADDR_IS_ROM (fault_PC))                            /* not the console ROM? */
+    ips = DIAG_TMR_IPUS * 1000000.0;                    /* nominal rate */
+else if (ips <= 0.0)                                    /* not yet calibrated? */
+    ips = 500000.0;                                     /* nominal VAX rate */
+us = ((now - diag_tmr_last) * 1000000.0 / ips) + diag_tmr_frac;
+diag_tmr_last = now;
+if (us < 0.0)                                           /* time restarted? */
+    us = 0.0;
+diag_tmr_us = diag_tmr_us + (uint32) us;
+diag_tmr_frac = us - (double) ((uint32) us);
+}
+
+static int32 diag_tmr_rd (void)
+{
+diag_tmr_update ();
+return (int32) ((((diag_tmr_us >> 10) & 0xFFFF) << 16) | (diag_tmr_us & 0x3FF));
+}
+
+static void diag_tmr_wr (int32 pa, int32 lnt)
+{
+diag_tmr_update ();
+if (lnt == L_LONG)                                      /* longword: both */
+    diag_tmr_us = 0;
+else if (pa & 2)                                        /* high word: DIAGTIMM */
+    diag_tmr_us = diag_tmr_us & 0x3FF;
+else diag_tmr_us = diag_tmr_us & ~0x3FF;                /* low word: DIAGTIMU */
+diag_tmr_frac = 0.0;
+}
+
 /* KA460 registers */
 
 int32 ka_rd (int32 pa)
@@ -851,8 +910,7 @@ switch (rg) {
         return ka_parctl & PARCTL_RD;
 
     case 7:                                             /* diag timer */
-        tmr_tir = (tmr_tir + 5) & 0xFFFF;
-        return (tmr_tir << 16) | tmr_tir;
+        return diag_tmr_rd ();
         }
 
 return 0;
@@ -898,7 +956,7 @@ switch (rg) {
         break;
 
     case 7:                                             /* diag timer */
-        tmr_tir = (val >> 16);
+        diag_tmr_wr (pa, lnt);
         }
 return;
 }
@@ -1000,7 +1058,11 @@ ka_mapbase = 0;
 ka_cfgtst = CFGT_L3C;
 ka_led = 0;
 ka_parctl = 0xF0;
-tmr_tir = 0;
+if (sim_switches & SWMASK ('P')) {                    /* power-up? */
+    diag_tmr_us = 0;                                    /* clear diag timer, */
+    diag_tmr_frac = 0.0;                                /* which an I/O reset */
+    diag_tmr_last = sim_gtime ();                       /* does not */
+    }
 
 if (isdn == NULL)                                       /* dummy mem for ISDN */
     isdn = (uint32 *) calloc (0x4000 >> 2, sizeof (uint32));
