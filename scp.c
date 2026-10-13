@@ -3057,7 +3057,8 @@ while (stat != SCPE_EXIT) {                             /* in case exit */
         sim_cptr_is_action[sim_do_depth] = FALSE;
         }
     if (cptr == NULL) {                                 /* EOF? or SIGINT? */
-        if (sim_ttisatty()) {
+        if (sim_ttisatty() &&
+            sim_fd_isatty (0)) {                        /* terminal not hung up? */
             printf ("\n");
             continue;                                   /* ignore tty EOF */
             }
@@ -12096,6 +12097,7 @@ do {
         (bare_reason != SCPE_REMOTE)  &&
         (bare_reason != SCPE_MTRLNT)  &&
         (bare_reason != SCPE_STOP)    &&
+        (bare_reason != SCPE_LOST)    &&
         (bare_reason != SCPE_STEP)    &&
         (bare_reason != SCPE_RUNTIME) &&
         (bare_reason != SCPE_EXIT)) {
