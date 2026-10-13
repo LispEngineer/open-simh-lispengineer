@@ -235,6 +235,7 @@ typedef struct RTC {
     uint32 clock_catchup_drops;     /* catch-ups that ended with time dropped */
     uint32 clock_time_idled;        /* total time idled */
     uint32 clock_time_idled_last;   /* total time idled as of the previous second */
+    uint32 clock_idle_past_us;      /* usecs idle sleeps ran past the tick this second */
     uint32 clock_calib_skip_idle;   /* Calibrations skipped due to idling */
     uint32 clock_calib_gap2big;     /* Calibrations skipped Gap Too Big */
     uint32 clock_calib_backwards;   /* Calibrations skipped Clock Running Backwards */
@@ -1046,6 +1047,7 @@ rtc->clock_catchup_ticks_curr = 0;
 rtc->clock_tick_rtime = 0;                          /* the next tick measures no gap */
 rtc->clock_tick_gap_time = 0;
 rtc->clock_tick_gaps = 0;
+rtc->clock_idle_past_us = 0;
 rtc->calib_ticks_acked_tot += rtc->calib_ticks_acked;
 rtc->calib_ticks_acked = 0;
 ++rtc->calib_initializations;
@@ -1065,6 +1067,7 @@ int32 sim_rtcn_calb (uint32 ticksper, int32 tmr)
 {
 uint32 new_rtime, delta_rtime, last_idle_pct, catchup_ticks_curr, kbd_rtime;
 uint32 tick_rtime, tick_gap, gap_rtime, gap_count, run_rtime;
+uint32 past_rtime;
 int32 delta_vtime;
 double new_gtime;
 int32 new_currd;
@@ -1139,6 +1142,8 @@ gap_rtime = rtc->clock_tick_gap_time;               /* wall time lost this secon
 gap_count = rtc->clock_tick_gaps;
 rtc->clock_tick_gap_time = 0;
 rtc->clock_tick_gaps = 0;
+past_rtime = rtc->clock_idle_past_us / 1000;       /* msecs idled past ticks */
+rtc->clock_idle_past_us = 0;
 /* A stall is one long gap, and a busy host adds a few; when most ticks  */
 /* are far apart the simulator was running with an interval far too     */
 /* long (a console ROM after a restart, say), and the second is measured */
@@ -1249,6 +1254,12 @@ if (sim_asynch_timer || (catchup_ticks_curr > 0)) {
     if (sim_asynch_timer)
         new_currd = (int32)((new_gtime - rtc->gtime)/ticksper);
     else {
+        /* sim_idle credits no instructions for the time a sleep ran */
+        /* past the tick it was waiting for (it rounds a sleep up to */
+        /* reach the tick when catch-up ticks are on), so that time  */
+        /* is not running time either.                               */
+        if (past_rtime < run_rtime)
+            run_rtime -= past_rtime;
         if (run_rtime < 500)
             new_currd = rtc->currd;
         else
@@ -1900,6 +1911,7 @@ int32 act_cyc, w_interval;
 double act_cyc_d, max_cyc;
 static t_bool in_nowait = FALSE;
 double cyc_since_idle;
+t_bool to_tick = FALSE;
 RTC *rtc = &rtcs[tmr];
 
 if (rtc->hz == 0)                                       /* specified timer is not running? */
@@ -1963,6 +1975,23 @@ if ((sim_idle_rate_ms == 0) || (sim_idle_cyc_ms == 0)) {/* not possible? */
     return FALSE;
     }
 w_ms = (uint32) sim_interval / sim_idle_cyc_ms;         /* ms to wait */
+/* The next event is normally the calibrated clock's tick.  When catch-up */
+/* ticks are on, sleep the whole number of msecs that reaches it, rather  */
+/* than the whole number that falls short of it.  The fraction of a msec  */
+/* left over is less than half a tick, so it would not be slept but       */
+/* executed: the simulated system's idle loop, at full speed, until the   */
+/* tick.  Whether that happened on almost every tick depended only on     */
+/* whether the calibrated tick came out a little over or a little under a */
+/* whole number of msecs.  A tick reached up to a msec late is repaid by  */
+/* catch-up ticks, as any late tick is; the time slept past it is neither */
+/* credited as instructions nor counted as running time (sim_rtcn_calb),  */
+/* so the instruction rate is measured as before.                         */
+if (sim_catchup_ticks && rtc->clock_catchup_eligible &&
+    (sim_clock_queue == rtc->timer_unit) &&
+    (((uint32) sim_interval % sim_idle_cyc_ms) != 0)) {
+    ++w_ms;                                             /* round up */
+    to_tick = TRUE;
+    }
 /* When the host system has a clock tick which is less frequent than the    */
 /* simulated system's clock, idling will cause delays which will miss       */
 /* simulated clock ticks.  To accomodate this, and still allow idling, if   */
@@ -1985,7 +2014,7 @@ in_nowait = FALSE;
 if (sim_clock_queue == QUEUE_LIST_END)
     sim_debug (DBG_IDL, &sim_timer_dev, "sleeping for %d ms - pending event in %d %s\n", w_ms, sim_interval, sim_vm_interval_units);
 else
-    sim_debug (DBG_IDL, &sim_timer_dev, "sleeping for %d ms - pending event on %s in %d %s\n", w_ms, sim_uname(sim_clock_queue), sim_interval, sim_vm_interval_units);
+    sim_debug (DBG_IDL, &sim_timer_dev, "sleeping for %d ms - pending event on %s in %d %s%s\n", w_ms, sim_uname(sim_clock_queue), sim_interval, sim_vm_interval_units, to_tick ? " (rounded up to reach it)" : "");
 cyc_since_idle = sim_gtime() - sim_idle_end_time;       /* time since prior idle */
 w_interval = sim_interval;                              /* pending event when the sleep began */
 if (sim_timer_elapsed) {                                /* measured on the elapsed clock */
@@ -2018,6 +2047,17 @@ else
    wall time beyond that is left to calibration and catch-up ticks.
    The whole sleep still counts as time idled.
  */
+if (to_tick && (act_cyc_d > (double)w_interval)) {   /* slept past the tick? */
+    double past_us = ((act_cyc_d - (double)w_interval) * 1000.0) / sim_idle_cyc_ms;
+
+    /* Rounding up adds less than a msec.  More than a tick past it is a   */
+    /* stall, which sim_rtcn_calb already leaves out as a gap between      */
+    /* ticks; count no more than a tick here, so it is not left out twice. */
+    if (past_us > 1000000.0 / rtc->hz)
+        past_us = 1000000.0 / rtc->hz;
+    rtc->clock_idle_past_us += (uint32)past_us;
+    act_cyc_d = (double)w_interval;                     /* credit up to the tick */
+    }
 max_cyc = (double)w_interval + (double)rtc->currd;
 if (act_cyc_d > max_cyc) {
     sim_debug (DBG_IDL, &sim_timer_dev, "slept for %u ms - credit limited from %.0f to %.0f %s (the pending event plus one tick)\n", act_ms, act_cyc_d, max_cyc, sim_vm_interval_units);
