@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-12)
+## Fixes carried (reviewed 2026-10-13)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -39,6 +39,9 @@ Build it exactly as Open SIMH, for example:
 | VAX: make the RZUSER disk type a fixed disk (an RZUSER unit was listed as removable) | `VAX/vax_rzdev.h` | #612 |
 | TIMER: keep the servo's virtual time in step during catch-up seconds (a stop at `sim>`, or `SET CLOCK NOCATCHUP`, cost the guest about a second) | `sim_timer.c` | #613 |
 | TIMER: a catch-up dropped at `sim>` no longer counts the stop twice (with `SET CLOCK ELAPSED`) | `sim_timer.c` | on this fork only for now; offered after #603 |
+| SCP: end the command loop when its terminal has hung up (a hangup during a run left SIMH spinning at `sim>`, NVRAM unwritten) | `scp.c` | #619 |
+| SCP: do not report a lost Telnet console as an internal error (no misleading `Unexpected internal error` line before the stop) | `scp.c` | #620 |
+| SOCK: bind a named listen address such as `localhost:P` to IPv4 when it has both families, falling back to the other family when a socket cannot be created (`localhost:P` listened on `[::1]` only, refusing clients that used 127.0.0.1) | `sim_sock.c` | #621 (two commits) |
 
 ## Behaviour that differs from Open SIMH
 
