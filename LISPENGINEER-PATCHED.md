@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-13)
+## Fixes carried (reviewed 2026-10-14)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -42,6 +42,7 @@ Build it exactly as Open SIMH, for example:
 | SCP: end the command loop when its terminal has hung up (a hangup during a run left SIMH spinning at `sim>`, NVRAM unwritten) | `scp.c` | #619 |
 | SCP: do not report a lost Telnet console as an internal error (no misleading `Unexpected internal error` line before the stop) | `scp.c` | #620 |
 | SOCK: bind a named listen address such as `localhost:P` to IPv4 when it has both families, falling back to the other family when a socket cannot be created (`localhost:P` listened on `[::1]` only, refusing clients that used 127.0.0.1) | `sim_sock.c` | #621 (two commits) |
+| TIMER: let an idle sleep reach the clock tick, not stop short of it (an idle guest's sleep stopped about 1 ms short of each tick and its idle loop spun to the tick: about 10 % of a host core for an idle VAXstation 4000/60 or MicroVAX 3900, now under 1 %) | `sim_timer.c` | #622 (on #596, #599 and #613) |
 
 ## Behaviour that differs from Open SIMH
 
