@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-14)
+## Fixes carried (reviewed 2026-10-16)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -43,6 +43,7 @@ Build it exactly as Open SIMH, for example:
 | SCP: do not report a lost Telnet console as an internal error (no misleading `Unexpected internal error` line before the stop) | `scp.c` | #620 |
 | SOCK: bind a named listen address such as `localhost:P` to IPv4 when it has both families, falling back to the other family when a socket cannot be created (`localhost:P` listened on `[::1]` only, refusing clients that used 127.0.0.1) | `sim_sock.c` | #621 (two commits) |
 | TIMER: let an idle sleep reach the clock tick, not stop short of it (an idle guest's sleep stopped about 1 ms short of each tick and its idle loop spun to the tick: about 10 % of a host core for an idle VAXstation 4000/60 or MicroVAX 3900, now under 1 %) | `sim_timer.c` | #622 (on #596, #599 and #613) |
+| TIMER: with `SET CLOCK ELAPSED`, a gap during a catch-up restarts its 30-second deadline (a second host suspend while the guest was still repaying the first dropped hours of the first); a clock that cannot keep up with real time says so once, then summarises every 10 minutes, instead of a pair of catch-up lines every 35 seconds | `sim_timer.c`, `scp.c` | #623 (two commits, on #603) |
 
 ## Behaviour that differs from Open SIMH
 
@@ -61,9 +62,11 @@ wall clock (Linux CLOCK_BOOTTIME, macOS CLOCK_MONOTONIC, Windows
 interrupt time). On simulators with catch-up ticks -- the VAX
 families -- a gap of any length, including a stop at sim> followed by
 CONTINUE, is repaid as a burst of clock ticks that must finish within
-30 seconds (the rest is dropped). The simulator prints
+30 seconds (the rest is dropped; another gap during a catch-up
+restarts the 30 seconds, so neither is lost). The simulator prints
 "Clock catch-up: N ms owed" and "Clock catch-up complete (dropped N
-ms)" on stdout around each catch-up of more than a second, and a
+ms)" on stdout around each catch-up of more than a second (a guest
+that cannot keep up with real time says so once instead), and a
 guest that sets its own time-of-year clock (SET TIME, an NTP step)
 ends a catch-up still under way. Other simulators get the elapsed
 clock but keep Open SIMH's rule for long gaps. SHOW CLOCKS prints the
