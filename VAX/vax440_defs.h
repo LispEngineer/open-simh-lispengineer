@@ -321,6 +321,7 @@ extern int32 sys_model;
 #define XS_WRITEB(ba,bc,buf)   Map_WriteB(ba, bc, buf, DMA_NI)
 #define XS_WRITEW(ba,bc,buf)   Map_WriteW(ba, bc, buf, DMA_NI)
 #define XS_ADRMBO       (0)
+#define XS_INT_LATCH                                    /* NI request latched on a rising edge */
 
 /* Function prototypes for I/O; the last argument names the DMA engine,
    which PAR_CTL reports an invalid map entry for */
