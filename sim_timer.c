@@ -233,6 +233,7 @@ typedef struct RTC {
     uint32 clock_catchup_since;     /* SET CLOCK ELAPSED: rtime base when it became eligible */
     double clock_catchup_dropped;   /* time owed that was dropped, not repaid (secs) */
     uint32 clock_catchup_drops;     /* catch-ups that ended with time dropped */
+    double clock_catchup_owed_last; /* time owed at the previous catch-up check (secs) */
     uint32 clock_time_idled;        /* total time idled */
     uint32 clock_time_idled_last;   /* total time idled as of the previous second */
     uint32 clock_calib_skip_idle;   /* Calibrations skipped due to idling */
@@ -905,6 +906,7 @@ if (owed <= 0.0)
     return 0.0;
 rtc->calib_tick_time += owed;
 rtc->vtime = _sim_timer_msec () - ((rtc->hz != 0) ? (rtc->ticks * 1000) / rtc->hz : 0);
+rtc->clock_catchup_owed_last = 0.0;
 rtc->clock_catchup_dropped += owed;
 ++rtc->clock_catchup_drops;
 return owed;
@@ -926,14 +928,21 @@ sim_printf ("Clock catch-up complete (dropped %.0f ms)\n", dropped * 1000.0);
 /* within SIM_CATCHUP_LIMIT secs of its start; whatever is still owed then  */
 /* is dropped.  Catch-up ticks come as fast as the simulated system takes   */
 /* them, which depends on the system and the host, so the bound is on time. */
+/* A gap during a catch-up already under way (a debt grown by more than     */
+/* SIM_CATCHUP_ANNOUNCE secs between two checks: a host suspend, a pause, a */
+/* stop at sim>) prints the total then owed and restarts the                */
+/* SIM_CATCHUP_LIMIT secs, so that what was owed before it is not dropped   */
+/* when the gap outlasts the time that was left.                            */
 
 static void _rtcn_catchup_limit (RTC *rtc, double tnow)
 {
-double owed;
+double owed, jump;
 
 if (!sim_timer_elapsed)
     return;
 owed = tnow - (rtc->clock_catchup_base_time + rtc->calib_tick_time);
+jump = owed - rtc->clock_catchup_owed_last;         /* owed since the previous check */
+rtc->clock_catchup_owed_last = owed;
 if (rtc->clock_catchup_limit_time == 0.0) {         /* not catching up? */
     if (owed > SIM_CATCHUP_ANNOUNCE) {
         rtc->clock_catchup_limit_time = tnow + SIM_CATCHUP_LIMIT;
@@ -941,6 +950,11 @@ if (rtc->clock_catchup_limit_time == 0.0) {         /* not catching up? */
         sim_printf ("Clock catch-up: %.0f ms owed\n", owed * 1000.0);
         }
     return;
+    }
+if (jump > SIM_CATCHUP_ANNOUNCE) {                  /* a gap during a catch-up? */
+    rtc->clock_catchup_limit_time = tnow + SIM_CATCHUP_LIMIT;
+    sim_debug (DBG_CAL, &sim_timer_dev, "catch-up of %.0f ms for %s started (a gap during a catch-up)\n", owed * 1000.0, sim_uname (rtc->clock_unit));
+    sim_printf ("Clock catch-up: %.0f ms owed\n", owed * 1000.0);
     }
 if (owed <= rtc->clock_tick_size)                   /* caught up? */
     _rtcn_catchup_end (rtc, 0.0);
@@ -1031,6 +1045,7 @@ rtc->calib_tick_time = 0;
 rtc->clock_catchup_pending = FALSE;
 rtc->clock_catchup_eligible = FALSE;
 rtc->clock_catchup_since = 0;
+rtc->clock_catchup_owed_last = 0.0;
 rtc->clock_catchup_ticks_tot += rtc->clock_catchup_ticks;
 rtc->clock_catchup_ticks = 0;
 rtc->clock_catchup_ticks_curr = 0;
