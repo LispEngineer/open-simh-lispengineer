@@ -44,6 +44,11 @@ Build it exactly as Open SIMH, for example:
 | SOCK: bind a named listen address such as `localhost:P` to IPv4 when it has both families, falling back to the other family when a socket cannot be created (`localhost:P` listened on `[::1]` only, refusing clients that used 127.0.0.1) | `sim_sock.c` | #621 (two commits) |
 | TIMER: let an idle sleep reach the clock tick, not stop short of it (an idle guest's sleep stopped about 1 ms short of each tick and its idle loop spun to the tick: about 10 % of a host core for an idle VAXstation 4000/60 or MicroVAX 3900, now under 1 %) | `sim_timer.c` | #622 (on #596, #599 and #613) |
 | TIMER: with `SET CLOCK ELAPSED`, a gap during a catch-up restarts its 30-second deadline (a second host suspend while the guest was still repaying the first dropped hours of the first); a clock that cannot keep up with real time says so once, then summarises every 10 minutes, instead of a pair of catch-up lines every 35 seconds | `sim_timer.c`, `scp.c` | #623 (two commits, on #603) |
+| LANCE (XS): an INIT whose initialization block cannot be read sets MERR, not IDON (the KA46 power-on NI test failed subtest D) | `VAX/vax_xs.c` | #624 |
+| VAX440: report an NI DMA through an invalid map entry in PAR_CTL<NI_MAP> | `VAX/vax440_defs.h`, `VAX/vax440_sysdev.c` | #625 |
+| VAX 4xx: the NI interrupt request is latched on the LANCE line's rising edge, as these boards' interrupt controllers do; STOP clears the rest of CSR0 | `VAX/vax_xs.c`, four VAX 4xx `_defs.h` files | #626 (on #587) |
+| LANCE (XS): internal loopback carries the CRC, and a frame under 60 bytes is not reported as a buffer error | `VAX/vax_xs.c`, `sim_ether.h` | #627 |
+| LANCE (XS): external loopback hands a sent frame back to the receiver (with the four above, the KA46 power-on NI test passes) | `VAX/vax_xs.c`, `sim_ether.h` | #628 |
 
 ## Behaviour that differs from Open SIMH
 
@@ -84,6 +89,18 @@ To get Open SIMH's timekeeping behaviour (with this branch's bug
 fixes still in effect): SET CLOCK NOELAPSED.
 Offered to Open SIMH as pull request #603 (with NOELAPSED as its
 default); the default is carried here for good.
+
+## Note: a VAXstation 4000/60 with a fresh NVR boots from the network
+
+With the NI fixes above the KA46's console power-on tests all pass, and a
+KA46 (and a MicroVAX 3100/80, KA47) whose NVR file is new then does what
+the real machine does with its factory settings: it boots `ESA0`, the
+network, and retries for ever (`83 BOOT SYS`, `-ESA0`, `?54 RETRY`), with
+a disk attached or not, instead of stopping at `>>>`. `^C` at the
+console does not stop it. To have the console stop at `>>>` after its
+power-on tests, type `SET HALT 3` at `>>>` once (or `SET BOOT DKA0` to
+boot the disk); the setting is kept in the attached NVR file. Open SIMH
+master still fails the NI test and stops at `>>>`.
 
 This file is updated each time the branch moves. Related Open SIMH issues: #594 (`SET <unit>
 FORMAT=` on an attached unit); #597 (`SET CLOCK ASYNCH` with idling enabled crashes the
