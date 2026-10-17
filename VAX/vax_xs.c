@@ -40,6 +40,17 @@
 #define GETW(p,x)         ((p[(x + 1)] << 8) | p[x])
 #define GETL(p,x)         ((p[(x + 3)] << 24) | (p[(x + 2)] << 16) | (p[(x + 1)] << 8) | p[x])
 
+/* The chip's interrupt line: CSR0<INTR> gated by CSR0<INEA>.
+
+   Where the system's interrupt controller latches the NI request on the line's
+   rising edge, and clears it only when the interrupt is acknowledged or
+   software writes INT_CLR (XS_INT_LATCH: the KA410, KA41/KA42, KA43 and
+   KA46/KA47/KA48 boards -- VAX410, VAX420, VAX43, VAX440), the request is
+   raised on that edge and never dropped by the chip.
+   Elsewhere the request follows the line. */
+
+#define XS_LINE(xs)       (((xs)->var->csr0 & (CSR0_INTR | CSR_IE)) == (CSR0_INTR | CSR_IE))
+
 extern int32 tmxr_poll;
 
 t_stat xs_svc (UNIT *uptr);
@@ -51,6 +62,7 @@ t_stat xs_init (CTLR* xs);
 void xs_updateint(CTLR* xs);
 void xs_setint (CTLR* xs);
 void xs_clrint (CTLR* xs);
+void xs_edge (CTLR* xs, t_bool line);
 void xs_read_callback (int status);
 void xs_write_callback (int status);
 t_stat xs_reset (DEVICE *dptr);
@@ -196,6 +208,9 @@ void xs_wr (int32 pa, int32 data, int32 access)
 {
 CTLR *xs = &xs_ctrl[0];
 int32 rg = (pa >> 2) & 3;
+#if defined (XS_INT_LATCH)
+t_bool line;
+#endif
 
 switch (rg) {
 
@@ -203,13 +218,19 @@ switch (rg) {
         switch (xs->var->rptr) {
 
             case 0:                                     /* NI_CSR0 */
+#if defined (XS_INT_LATCH)
+                line = XS_LINE (xs);
+#endif
                 xs->var->csr0 = (xs->var->csr0 & ~CSR0_RW) | (data & CSR0_RW);
                 xs->var->csr0 = xs->var->csr0 & ~(data & CSR0_W1C);
+#if defined (XS_INT_LATCH)
+                xs_updateint (xs);                      /* the write itself drops the line, */
+                xs_edge (xs, line);                     /* or raises it by setting INEA */
+                line = XS_LINE (xs);
+#endif
 
                 if (data & CSR0_STOP) {                 /* STOP */
-                    xs->var->csr0 = xs->var->csr0 | CSR0_STOP;
-                    xs->var->csr0 = xs->var->csr0 & ~(CSR0_STRT | CSR0_INIT | CSR0_IDON | CSR0_TXON | CSR0_RXON);
-                    xs->var->csr0 = xs->var->csr0 & ~(CSR0_ERR | CSR0_ESUM);
+                    xs->var->csr0 = CSR0_STOP;          /* clears all the other bits */
                     sim_cancel (&xs_unit);
                     }
                 else if ((data & CSR0_INIT) && (!(xs->var->csr0 & CSR0_INIT)))   /* INIT */
@@ -229,6 +250,9 @@ switch (rg) {
 
                 xs_updateint (xs);
 
+#if defined (XS_INT_LATCH)
+                xs_edge (xs, line);
+#else
                 /* The chip's interrupt pin is CSR0<INTR> gated by CSR0<INEA>: clearing
                    INEA drops it, and setting INEA while INTR is already set asserts it at
                    once. xs_setint() only raises the request when INTR goes from 0 to 1,
@@ -239,6 +263,7 @@ switch (rg) {
                     CLR_INT (XS1);
                 else if ((xs->var->csr0 & (CSR0_INTR + CSR_IE)) == (CSR0_INTR + CSR_IE))
                     SET_INT (XS1);
+#endif
                 break;
 
             case 1:                                     /* NI_CSR1 */
@@ -274,9 +299,16 @@ CTLR *xs = &xs_ctrl[0];
 
 if ((xs->var->csr0 & (CSR0_STRT | CSR0_INIT)) == CSR0_INIT) {
     /* Init done */
+#if defined (XS_INT_LATCH)
+    t_bool line = XS_LINE (xs);
+
+    xs->var->csr0 = xs->var->csr0 | (CSR0_IDON | CSR0_INTR);
+    xs_edge (xs, line);
+#else
     xs->var->csr0 = xs->var->csr0 | (CSR0_IDON | CSR0_INTR);
     if (xs->var->csr0 & CSR_IE)
         SET_INT (XS1);
+#endif
     return SCPE_OK;
     }
 
@@ -358,8 +390,8 @@ while (xs->var->ReadQ.count > 0) {
     /* get first packet from receive queue */
     if (!item) {
         item = &xs->var->ReadQ.item[xs->var->ReadQ.head];
-        /* Pad the packet to minimum size */
-        if (item->packet.len < ETH_MIN_PACKET) {
+        /* Pad the packet to minimum size (a looped back frame arrives as it was sent) */
+        if ((item->packet.len < ETH_MIN_PACKET) && (item->type != ETH_ITM_LOOPBACK)) {
             int len = item->packet.len;
             memset (&item->packet.msg[len], 0, ETH_MIN_PACKET - len);
             item->packet.len = ETH_MIN_PACKET;
@@ -459,12 +491,12 @@ while (xs->var->ReadQ.count > 0) {
 void xs_process_transmit (CTLR* xs)
 {
 uint32 segb, ba;
-int slen, wlen, off, giant, runt;
+int slen, wlen, off, giant;
 t_stat rstatus, wstatus;
 
 /* sim_debug(DBG_TRC, xs->dev, "xs_process_transmit()\n"); */
 
-off = giant = runt = 0;
+off = giant = 0;
 for (;;) {
 
     /* get next transmit buffer */
@@ -494,7 +526,7 @@ for (;;) {
     /* prepare to accumulate transmit information if start of frame */
     if (xs->var->txhdr[1] & TXR_STF) {
         memset(&xs->var->write_buffer, 0, sizeof(ETH_PACK));
-        off = giant = runt = 0;
+        off = giant = 0;
         }
 
     /* get packet data from host */
@@ -516,19 +548,32 @@ for (;;) {
     /* transmit packet when end-of-frame is reached */
     if (xs->var->txhdr[1] & TXR_ENF) {
 
-        /* make sure packet is minimum length */
-        if (xs->var->write_buffer.len < ETH_MIN_PACKET) {
-            xs->var->write_buffer.len = ETH_MIN_PACKET;  /* pad packet to minimum length */
-            runt = 1;
-            }
-
         /* are we in internal loopback mode ? */
         if ((xs->var->mode & MODE_LOOP) && (xs->var->mode & MODE_INTL)) {
-            /* just put packet in  receive buffer */
-            ethq_insert (&xs->var->ReadQ, 1, &xs->var->write_buffer, 0);
+            /* just put packet in receive buffer, as it was sent: not padded, and
+               with the CRC the chip appends, in the form the receive path expects
+               of a frame from the network (which it reverses into the chip's byte
+               order). With MODE<DTCR> no CRC is appended: the frame's own last four
+               bytes are taken as its CRC, already in the chip's order. */
+            if (!(xs->var->mode & MODE_DTCR))
+                xs->var->write_buffer.crc_len = eth_add_packet_crc32 (xs->var->write_buffer.msg, xs->var->write_buffer.len);
+            else if (xs->var->write_buffer.len >= 4) {
+                uint8 *crc = &xs->var->write_buffer.msg[xs->var->write_buffer.len - 4];
+                uint8 b;
+
+                b = crc[0]; crc[0] = crc[3]; crc[3] = b;
+                b = crc[1]; crc[1] = crc[2]; crc[2] = b;
+                xs->var->write_buffer.crc_len = xs->var->write_buffer.len;
+                }
+            if (xs->var->write_buffer.crc_len >= 4)     /* not a frame shorter than its CRC */
+                ethq_insert (&xs->var->ReadQ, ETH_ITM_LOOPBACK, &xs->var->write_buffer, 0);
             sim_debug(DBG_TRC, xs->dev, "loopback packet\n");
             }
         else {
+            /* the chip sends a short frame as it is; the host network needs it padded */
+            if (xs->var->write_buffer.len < ETH_MIN_PACKET)
+                xs->var->write_buffer.len = ETH_MIN_PACKET;  /* pad packet to minimum length */
+
             /* transmit packet synchronously - write callback sets status */
             wstatus = eth_write(xs->var->etherface, &xs->var->write_buffer, xs->var->wcallback);
             if (wstatus) {
@@ -545,6 +590,31 @@ for (;;) {
                 eth_packet_trace_ex (xs->var->etherface, xs->var->write_buffer.msg, xs->var->write_buffer.len, "xs-write", DEBUG_PRI (xs_dev, DBG_DAT), DBG_PCK);
             }
 
+        /* In external loopback the transceiver hands a frame that went out back
+           to the receiver as it was sent: not padded (off bytes), with the CRC
+           the chip appends, in the form the receive path expects of a frame from
+           the network (which it reverses into the chip's byte order). With
+           MODE<DTCR> no CRC is appended: the frame's own last four bytes are
+           taken as its CRC, already in the chip's order. A frame that was not
+           sent (unattached) is not echoed, as on a machine with no cable. */
+        if (((xs->var->mode & (MODE_LOOP | MODE_INTL)) == MODE_LOOP) &&
+            (wstatus == SCPE_OK) && (xs->var->write_buffer.status == 0)) {
+            xs->var->write_buffer.len = off;
+            xs->var->write_buffer.crc_len = 0;
+            if (!(xs->var->mode & MODE_DTCR))
+                xs->var->write_buffer.crc_len = eth_add_packet_crc32 (xs->var->write_buffer.msg, off);
+            else if (off >= 4) {
+                uint8 *crc = &xs->var->write_buffer.msg[off - 4];
+                uint8 b;
+
+                b = crc[0]; crc[0] = crc[3]; crc[3] = b;
+                b = crc[1]; crc[1] = crc[2]; crc[2] = b;
+                xs->var->write_buffer.crc_len = off;
+                }
+            if (xs->var->write_buffer.crc_len >= 4)     /* not a frame shorter than its CRC */
+                ethq_insert (&xs->var->ReadQ, ETH_ITM_LOOPBACK, &xs->var->write_buffer, 0);
+            }
+
         /* update transmit status in transmit buffer */
         if (xs->var->write_buffer.status != 0) {
             /* failure */
@@ -554,8 +624,8 @@ for (;;) {
             xs->var->txhdr[1] |= TXR_ERRS;
             }
 
-        /* was packet too big or too small? */
-        if (giant || runt) {
+        /* was packet too big? */
+        if (giant) {
             xs->var->txhdr[3] |= TXR_BUFL;
             xs->var->txhdr[1] |= TXR_ERRS;
             }
@@ -610,7 +680,7 @@ sim_debug (DBG_REG, &xs_dev, "xs_inbb = %04X\n", xs->var->inbb);
 
 if (XS_READB (xs->var->inbb, 0x18, &inb[0])) {
     /* memory read error */
-    xs->var->csr0 |= (CSR0_MERR | CSR0_IDON | CSR0_INTR);
+    xs->var->csr0 |= (CSR0_MERR | CSR0_INTR);
     xs->var->csr0 &= ~(CSR0_RXON | CSR0_TXON);
     return SCPE_OK;
     }
@@ -691,7 +761,17 @@ if (xs->var->csr0 & CSR_IE)
 void xs_clrint (CTLR* xs)
 {
 xs->var->csr0 &= ~CSR0_INTR;
+#if !defined (XS_INT_LATCH)
 CLR_INT (XS1);
+#endif
+}
+
+/* Raise the request if the line has risen since it was 'line' */
+
+void xs_edge (CTLR* xs, t_bool line)
+{
+if (!line && XS_LINE (xs))
+    SET_INT (XS1);
 }
 
 void xs_read_callback(int status)
