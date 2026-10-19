@@ -1235,8 +1235,9 @@ ka_led = val;
 
 /* Board registers (25C0.0000)
 
-   +00  SCSI DMA window address (22 bits); the console reads back what it
-        wrote (00001600 on a real 4000/90)
+   +00  SCSI DMA window address (22 bits), the SQWF's address counter: a
+        read gives the running address (00001600 on a real 4000/90, read
+        at its console)
    +04  SCSI DMA direction: 0 = data in (to memory), 1 = data out; the real
         machine read 00001601 with the address at 1600, so a read returns
         the address with the direction in bit 0 (guess)
@@ -1459,7 +1460,12 @@ return 0;
 /* The SQWF, the board's DMA engine for the 53C94 (vax4xx_rz94.c calls
    these through RZ_DMA_READ, RZ_DMA_WRITE and RZ_DMA_DONE): it moves the
    data between the chip and memory through the scatter/gather map, from
-   the window address in the DMA address register. */
+   the window address in the DMA address register, and its address counter
+   moves on by every byte that crosses the SCSI bus.  The console relies on
+   that: a transfer longer than the 53C94's 64 KB count is done as several
+   DMA commands, between which the console reloads only the 53C94's count
+   (ROM 1B368, 1B124); the address register is rewritten only after a
+   phase change. */
 
 int32 sqwf_read (uint32 bc, uint8 *buf)
 {
@@ -1473,6 +1479,7 @@ return Map_WriteB ((uint32) ka_dmaadr, (int32) bc, buf);
 
 void sqwf_done (uint32 n)
 {
+ka_dmaadr = (ka_dmaadr + (int32) n) & 0x003FFFFF;
 }
 
 /* Network address ROM (2780.0000): each byte sits in the low byte of its

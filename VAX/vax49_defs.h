@@ -454,6 +454,7 @@ extern int32 sys_model;
 #define RZ_DMA_WRITE(rz,bc,buf) sqwf_write (bc, buf)
 #define RZ_DMA_DONE(rz,n)       sqwf_done (n)
 #define RZ_INT_LEVEL    1
+#define RZ_ABSENT_UNATTACHED 1                          /* no drive behind an empty unit */
 
 /* Function prototypes for I/O */
 
