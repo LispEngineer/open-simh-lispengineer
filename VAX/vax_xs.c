@@ -337,6 +337,8 @@ sim_clock_coschedule (uptr, tmxr_poll);
 return SCPE_OK;
 }
 
+static int scaffold_ring_full = 0;                      /* SCAFFOLD 10.6 */
+
 /* Transfer received packets into receive ring. */
 void xs_process_receive(CTLR* xs)
 {
@@ -357,6 +359,7 @@ if (no_buffers)
 
 /* check read queue for buffer loss */
 if (xs->var->ReadQ.loss) {
+    sim_debug (DBG_PCK, xs->dev, "SCAFFOLD ReadQ loss %d, count %d\n", xs->var->ReadQ.loss, xs->var->ReadQ.count);
     xs->var->ReadQ.loss = 0;
     }
 
@@ -376,12 +379,20 @@ while (xs->var->ReadQ.count > 0) {
     if (!(xs->var->rxhdr[1] & RXR_OWN)) {
         /* tell the host there are no more buffers */
         /* xs->var->csr0 |= CSR0_MISS; */ /* I don't think this is correct 08-dec-2005 dth */
+        if (!scaffold_ring_full) {
+            sim_debug (DBG_PCK, xs->dev, "SCAFFOLD ring full at rxnext %d, ReadQ %d\n", xs->var->rxnext, xs->var->ReadQ.count);
+            scaffold_ring_full = 1;
+            }
         sim_debug(DBG_TRC, xs->dev, "Stopping input processing - Not Owned receive descriptor=0x%X, ", ba);
         sim_debug_bits(DBG_TRC, xs->dev, xs_rdes_w2, xs->var->rxhdr[2], xs->var->rxhdr[2], 0);
         sim_debug_bits(DBG_TRC, xs->dev, xs_rdes_w3, xs->var->rxhdr[3], xs->var->rxhdr[3], 1);
         break;
         }
 
+    if (scaffold_ring_full) {
+        sim_debug (DBG_PCK, xs->dev, "SCAFFOLD ring free at rxnext %d, ReadQ %d\n", xs->var->rxnext, xs->var->ReadQ.count);
+        scaffold_ring_full = 0;
+        }
     /* set buffer length and address */
     slen = (uint16)(xs->var->rxhdr[2] * -1);            /* 2s Complement */
     segb = xs->var->rxhdr[0] + ((xs->var->rxhdr[1] & RXR_HADR) << 16);
@@ -479,6 +490,7 @@ while (xs->var->ReadQ.count > 0) {
 
     /* if we failed to finish receiving the frame, flush the packet */
     if (item) {
+        sim_debug (DBG_PCK, xs->dev, "SCAFFOLD partial frame flushed, MISS set\n");
         ethq_remove(&xs->var->ReadQ);
         xs->var->csr0 |= CSR0_MISS;
         }
@@ -576,6 +588,8 @@ for (;;) {
 
             /* transmit packet synchronously - write callback sets status */
             wstatus = eth_write(xs->var->etherface, &xs->var->write_buffer, xs->var->wcallback);
+            if (wstatus || xs->var->write_buffer.status)
+                sim_debug (DBG_PCK, xs->dev, "SCAFFOLD eth_write wstatus %d status %d\n", wstatus, xs->var->write_buffer.status);
             if (wstatus) {
                 /* Nothing was sent (unattached, or rejected before the write
                    callback ran): report loss of carrier in the descriptor, as the
@@ -778,8 +792,18 @@ void xs_read_callback(int status)
 {
 CTLR *xs = &xs_ctrl[0];
 
-if (DEBUG_PRI (xs_dev, DBG_PCK))
-    eth_packet_trace_ex (xs->var->etherface, xs->var->read_buffer.msg, xs->var->read_buffer.len, "xs-recvd", DEBUG_PRI (xs_dev, DBG_DAT), DBG_PCK);
+if (DEBUG_PRI (xs_dev, DBG_PCK)) {                     /* SCAFFOLD 10.6: queue depths */
+    static int32 last_eth_loss = 0;
+    char txt[64];
+    ETH_DEV *e = xs->var->etherface;
+
+    snprintf (txt, sizeof (txt), "xs-recvd q %d/%d", e->read_queue.count, xs->var->ReadQ.count);
+    eth_packet_trace_ex (e, xs->var->read_buffer.msg, xs->var->read_buffer.len, txt, DEBUG_PRI (xs_dev, DBG_DAT), DBG_PCK);
+    if (e->read_queue.loss != last_eth_loss) {
+        sim_debug (DBG_PCK, &xs_dev, "SCAFFOLD eth read_queue loss %d (was %d), high %d\n", e->read_queue.loss, last_eth_loss, e->read_queue.high);
+        last_eth_loss = e->read_queue.loss;
+        }
+    }
 
 /* add packet to read queue */
 ethq_insert(&xs->var->ReadQ, 2, &xs->var->read_buffer, 0);

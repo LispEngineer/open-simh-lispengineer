@@ -614,10 +614,24 @@ void eth_packet_trace_ex(ETH_DEV* dev, const uint8 *msg, int len, const char* tx
     char dst[20];
     const unsigned short* proto = (const unsigned short*) &msg[12];
     uint32 crc = eth_crc32(0, msg, len);
+    char tcp[160] = "";                     /* SCAFFOLD 10.6: TCP header summary */
     eth_mac_fmt(msg, dst);
     eth_mac_fmt(msg + 6, src);
-    sim_debug(reason, dev->dptr, "%s  dst: %s  src: %s  proto: 0x%04X  len: %d  crc: %X\n",
-          txt, dst, src, ntohs(*proto), len, crc);
+    if ((len >= 54) && (msg[12] == 0x08) && (msg[13] == 0x00) && (msg[23] == 6)) {
+      int ihl = (msg[14] & 0xF) * 4;
+      int tot = (msg[16] << 8) | msg[17];
+      const uint8 *t = &msg[14 + ihl];
+      if (14 + ihl + 20 <= len) {
+        int doff = (t[12] >> 4) * 4;
+        snprintf (tcp, sizeof (tcp), "  tcp %u>%u seq %u ack %u fl %02X win %u plen %d id %u",
+                  (t[0] << 8) | t[1], (t[2] << 8) | t[3],
+                  (uint32)((t[4] << 24) | (t[5] << 16) | (t[6] << 8) | t[7]),
+                  (uint32)((t[8] << 24) | (t[9] << 16) | (t[10] << 8) | t[11]),
+                  t[13], (t[14] << 8) | t[15], tot - ihl - doff, (msg[18] << 8) | msg[19]);
+        }
+      }
+    sim_debug(reason, dev->dptr, "%s  dst: %s  src: %s  proto: 0x%04X  len: %d  crc: %X%s\n",
+          txt, dst, src, ntohs(*proto), len, crc, tcp);
     if (detail) {
       int i, same, group, sidx, oidx;
       char outbuf[80], strbuf[18];
