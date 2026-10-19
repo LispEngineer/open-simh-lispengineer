@@ -364,35 +364,48 @@ return m;
    INT_CLR (vax4xx_rz94.c sets and clears INT_REQ<1> itself, RZ_INT_LEVEL
    in vax49_defs.h).
 
-   The DZ's requests are levels too: receive while RIE and RDONE (or the
-   silo alarm), transmit while TIE and TRDY, whatever INT_CLR did.  The
-   console's DZ handlers write INT_CLR = 08 and then keep serving the
-   chip; its interrupt-driven loopback test only works if a transmit
-   request that is still asserted comes back after the receive handler
-   has cleared bit 3. */
+   The DZ's requests are latched.  The DC7085 asks for service whenever it
+   re-evaluates its state (a register access, a character sent, its poll):
+   vax4xx_dz.c then sets or clears DZRX and DZTX in int_req, as it does for
+   every VAXstation.  A latched request counts only while the chip still
+   asserts it by the DZ11 rules (receive: RIE and RDONE, or the silo alarm;
+   transmit: TIE and TRDY; dz_int_level), the acknowledge removes it, and
+   INT_CLR does not remove a request that the chip still asserts.  Two
+   programs fix this behaviour, though not the circuit behind it (guess):
 
-static void int_sync_dz (void)
+   - the console's DZ handlers write INT_CLR = 08 and go on serving the
+     chip, and its interrupt-driven loopback test works only if a transmit
+     request that is still asserted is seen again after the receive
+     handler has cleared bit 3;
+   - VMS's DZ driver sets TIE while the console's polled output has left
+     line 3 enabled in TCR with TRDY set, and its transmit interrupt
+     routine, having nothing to send, returns without touching the chip:
+     a request that followed the chip as a level would interrupt it for
+     ever (it did, in the first VMS boot of this model). */
+
+static int32 dz_pending (void)                          /* latched DZ requests still asserted */
 {
 int32 lvl = dz_int_level ();
+int32 r = 0;
 
-if (lvl & 1)
-    SET_INT (DZRX);
-else
-    CLR_INT (DZRX);
-if (lvl & 2)
-    SET_INT (DZTX);
-else
-    CLR_INT (DZTX);
+if ((lvl & 1) && (int_req[IPL_DZRX] & INT_DZRX))
+    r = r | INT_DZRX;
+if ((lvl & 2) && (int_req[IPL_DZTX] & INT_DZTX))
+    r = r | INT_DZTX;
+return r;
+}
+
+static int32 int_pending (void)                         /* IPL 15 requests, as int_req[1] bits */
+{
+return (int_req[IPL_SC] & ~(INT_DZRX | INT_DZTX)) | dz_pending ();
 }
 
 static int32 int_req_reg (void)                         /* INT_REQ as the CPU reads it */
 {
-int32 r;
+int32 p = int_pending ();
+int32 r = p & 0xFF;
 
-int_sync_dz ();
-r = int_req[IPL_SC] & 0xFF;
-
-if (int_req[IPL_DZTX] & INT_DZTX)
+if (p & INT_DZTX)
     r = r | INT_DZRX;                                   /* the DZ is one bit */
 return r;
 }
@@ -421,8 +434,7 @@ if ((ipl < 0x17) && int_req[0x17 - IPL_HMIN])           /* IRQ_H<3>: no sources 
     return 0x17;
 if ((ipl < IPL_CLK) && (tmr_int || int_req[IPL_CLK - IPL_HMIN]))
     return IPL_CLK;                                     /* interval timer */
-int_sync_dz ();
-if ((ipl < 0x15) && (int_req[0x15 - IPL_HMIN] & int_mask_expanded ()))
+if ((ipl < 0x15) && (int_pending () & int_mask_expanded ()))
     return 0x15;                                        /* board devices */
 if ((ipl < 0x14) && int_req[0x14 - IPL_HMIN])           /* SGEC */
     return 0x14;
@@ -442,7 +454,8 @@ return 0;
    The NVAX runs an interrupt acknowledge and the NCA answers with the
    vector of the source; a vector of 0 is a passive release (nothing to
    take).  The 53C94 and DZ requests are levels that follow the chips
-   (vax4xx_rz94.c, int_sync_dz), so the acknowledge clears nothing. */
+   (vax4xx_rz94.c), so the acknowledge clears nothing there; the DZ's
+   latched request is removed by the acknowledge. */
 
 int32 get_vector (int32 lvl)
 {
@@ -463,14 +476,17 @@ switch (lvl) {
         return SCB_INTTIM;
 
     case 0x15:                                          /* board devices */
-        int_sync_dz ();
-        pend = int_req[IPL_SC] & int_mask_expanded ();
+        pend = int_pending () & int_mask_expanded ();
         if (pend & INT_SC)                              /* 53C94: level, follows the chip */
             return VEC_SC;
-        if (pend & INT_DZRX)                            /* DZ: levels, follow the chip */
+        if (pend & INT_DZRX) {                          /* DZ: latched requests */
+            CLR_INT (DZRX);
             return VEC_DZRX;
-        if (pend & INT_DZTX)
+            }
+        if (pend & INT_DZTX) {
+            CLR_INT (DZTX);
             return VEC_DZTX;
+            }
         if (pend & INT_AUD)
             return VEC_AUD;
         return 0;                                       /* passive release */
@@ -1277,8 +1293,14 @@ switch (rg) {
         if ((pa & 3) == 0) {
             int32 clr = val & 0xFF;
             sim_debug (DBG_INT, &sysd_dev, "INT_CLR %02X (requests %02X)\n", clr, int_req_reg ());
-            if (clr & INT_DZRX)                         /* the DZ bit clears both directions */
-                clr = clr | INT_DZTX;
+            if (clr & INT_DZRX) {                       /* the DZ bit: both directions, */
+                int32 lvl = dz_int_level ();            /* except a request still asserted */
+                clr = clr & ~INT_DZRX;
+                if ((lvl & 1) == 0)
+                    clr = clr | INT_DZRX;
+                if ((lvl & 2) == 0)
+                    clr = clr | INT_DZTX;
+                }
             clr = clr & ~INT_SC;                        /* the 53C94 request follows the chip */
             int_req[IPL_SC] = int_req[IPL_SC] & ~clr;
             SET_IRQL;
