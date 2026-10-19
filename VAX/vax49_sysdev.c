@@ -231,6 +231,7 @@ extern void nvr_wr (int32 pa, int32 val, int32 lnt);
 extern int32 nar_rd (int32 pa);
 extern int32 dz_rd (int32 pa);
 extern void dz_wr (int32 pa, int32 val, int32 lnt);
+extern int32 dz_int_level (void);
 extern int32 rz_rd (int32 pa);
 extern void rz_wr (int32 pa, int32 val, int32 lnt);
 extern uint32 rz_dma;
@@ -372,11 +373,33 @@ if ((rz_stat & RZ_STS_INT) == 0)
     CLR_INT (SC);
 }
 
+/* The DZ's requests are levels too: receive while RIE and RDONE (or the
+   silo alarm), transmit while TIE and TRDY, whatever INT_CLR did.  The
+   console's DZ handlers write INT_CLR = 08 and then keep serving the
+   chip; its interrupt-driven loopback test only works if a transmit
+   request that is still asserted comes back after the receive handler
+   has cleared bit 3. */
+
+static void int_sync_dz (void)
+{
+int32 lvl = dz_int_level ();
+
+if (lvl & 1)
+    SET_INT (DZRX);
+else
+    CLR_INT (DZRX);
+if (lvl & 2)
+    SET_INT (DZTX);
+else
+    CLR_INT (DZTX);
+}
+
 static int32 int_req_reg (void)                         /* INT_REQ as the CPU reads it */
 {
 int32 r;
 
 int_sync_scsi ();
+int_sync_dz ();
 r = int_req[IPL_SC] & 0xFF;
 
 if (int_req[IPL_DZTX] & INT_DZTX)
@@ -409,6 +432,7 @@ if ((ipl < 0x17) && int_req[0x17 - IPL_HMIN])           /* IRQ_H<3>: no sources 
 if ((ipl < IPL_CLK) && (tmr_int || int_req[IPL_CLK - IPL_HMIN]))
     return IPL_CLK;                                     /* interval timer */
 int_sync_scsi ();
+int_sync_dz ();
 if ((ipl < 0x15) && (int_req[0x15 - IPL_HMIN] & int_mask_expanded ()))
     return 0x15;                                        /* board devices */
 if ((ipl < 0x14) && int_req[0x14 - IPL_HMIN])           /* SGEC */
@@ -428,8 +452,8 @@ return 0;
 
    The NVAX runs an interrupt acknowledge and the NCA answers with the
    vector of the source; a vector of 0 is a passive release (nothing to
-   take).  The DZ requests are cleared when they are acknowledged, as in
-   the KA46 model: the DZ raises them again while it still wants service. */
+   take).  The 53C94 and DZ requests are levels that follow the chips
+   (int_sync_scsi, int_sync_dz), so the acknowledge clears nothing. */
 
 int32 get_vector (int32 lvl)
 {
@@ -451,17 +475,14 @@ switch (lvl) {
 
     case 0x15:                                          /* board devices */
         int_sync_scsi ();
+        int_sync_dz ();
         pend = int_req[IPL_SC] & int_mask_expanded ();
         if (pend & INT_SC)                              /* 53C94: level, follows the chip */
             return VEC_SC;
-        if (pend & INT_DZRX) {
-            CLR_INT (DZRX);
+        if (pend & INT_DZRX)                            /* DZ: levels, follow the chip */
             return VEC_DZRX;
-            }
-        if (pend & INT_DZTX) {
-            CLR_INT (DZTX);
+        if (pend & INT_DZTX)
             return VEC_DZTX;
-            }
         if (pend & INT_AUD)
             return VEC_AUD;
         return 0;                                       /* passive release */
