@@ -234,8 +234,6 @@ extern void dz_wr (int32 pa, int32 val, int32 lnt);
 extern int32 dz_int_level (void);
 extern int32 rz_rd (int32 pa);
 extern void rz_wr (int32 pa, int32 val, int32 lnt);
-extern uint32 rz_dma;
-extern uint8 rz_stat;
 extern uint32 *rom;
 extern UNIT clk_unit;
 
@@ -362,18 +360,11 @@ return m;
 }
 
 /* The 53C94's request follows the chip's INT output: it goes away when
-   the processor reads the chip's interrupt register (vax4xx_rz94.c clears
-   its status bit 7 then), with no write to INT_CLR. */
+   the processor reads the chip's interrupt register, with no write to
+   INT_CLR (vax4xx_rz94.c sets and clears INT_REQ<1> itself, RZ_INT_LEVEL
+   in vax49_defs.h).
 
-#define RZ_STS_INT      0x80                            /* 53C94 status: interrupt */
-
-static void int_sync_scsi (void)
-{
-if ((rz_stat & RZ_STS_INT) == 0)
-    CLR_INT (SC);
-}
-
-/* The DZ's requests are levels too: receive while RIE and RDONE (or the
+   The DZ's requests are levels too: receive while RIE and RDONE (or the
    silo alarm), transmit while TIE and TRDY, whatever INT_CLR did.  The
    console's DZ handlers write INT_CLR = 08 and then keep serving the
    chip; its interrupt-driven loopback test only works if a transmit
@@ -398,7 +389,6 @@ static int32 int_req_reg (void)                         /* INT_REQ as the CPU re
 {
 int32 r;
 
-int_sync_scsi ();
 int_sync_dz ();
 r = int_req[IPL_SC] & 0xFF;
 
@@ -431,7 +421,6 @@ if ((ipl < 0x17) && int_req[0x17 - IPL_HMIN])           /* IRQ_H<3>: no sources 
     return 0x17;
 if ((ipl < IPL_CLK) && (tmr_int || int_req[IPL_CLK - IPL_HMIN]))
     return IPL_CLK;                                     /* interval timer */
-int_sync_scsi ();
 int_sync_dz ();
 if ((ipl < 0x15) && (int_req[0x15 - IPL_HMIN] & int_mask_expanded ()))
     return 0x15;                                        /* board devices */
@@ -453,7 +442,7 @@ return 0;
    The NVAX runs an interrupt acknowledge and the NCA answers with the
    vector of the source; a vector of 0 is a passive release (nothing to
    take).  The 53C94 and DZ requests are levels that follow the chips
-   (int_sync_scsi, int_sync_dz), so the acknowledge clears nothing. */
+   (vax4xx_rz94.c, int_sync_dz), so the acknowledge clears nothing. */
 
 int32 get_vector (int32 lvl)
 {
@@ -474,7 +463,6 @@ switch (lvl) {
         return SCB_INTTIM;
 
     case 0x15:                                          /* board devices */
-        int_sync_scsi ();
         int_sync_dz ();
         pend = int_req[IPL_SC] & int_mask_expanded ();
         if (pend & INT_SC)                              /* 53C94: level, follows the chip */
@@ -1239,11 +1227,11 @@ int32 val;
 switch (rg) {
 
     case 0:                                             /* DMA address */
-        val = (int32) rz_dma & 0x003FFFFF;
+        val = ka_dmaadr & 0x003FFFFF;
         break;
 
     case 1:                                             /* DMA direction */
-        val = ((int32) rz_dma & 0x003FFFFE) | (ka_dmadir & 1);
+        val = (ka_dmaadr & 0x003FFFFE) | (ka_dmadir & 1);
         break;
 
     case 2:                                             /* INT_MSK */
@@ -1270,8 +1258,7 @@ sim_debug (DBG_REG, &sysd_dev, "board write %08X = %08X (length %d)\n", pa, val,
 switch (rg) {
 
     case 0:                                             /* DMA address */
-        ka_dmaadr = val & 0x003FFFFF;
-        rz_dma = (uint32) ka_dmaadr;                    /* the 53C94's DMA starts here */
+        ka_dmaadr = val & 0x003FFFFF;                   /* the 53C94's DMA starts here */
         break;
 
     case 1:                                             /* DMA direction */
@@ -1433,6 +1420,25 @@ for (i = 0; i < bc; i = i + 2) {
     ma = ma + 2;
     }
 return 0;
+}
+
+/* The SQWF, the board's DMA engine for the 53C94 (vax4xx_rz94.c calls
+   these through RZ_DMA_READ, RZ_DMA_WRITE and RZ_DMA_DONE): it moves the
+   data between the chip and memory through the scatter/gather map, from
+   the window address in the DMA address register. */
+
+int32 sqwf_read (uint32 bc, uint8 *buf)
+{
+return Map_ReadB ((uint32) ka_dmaadr, (int32) bc, buf);
+}
+
+int32 sqwf_write (uint32 bc, uint8 *buf)
+{
+return Map_WriteB ((uint32) ka_dmaadr, (int32) bc, buf);
+}
+
+void sqwf_done (uint32 n)
+{
 }
 
 /* Network address ROM (2780.0000): each byte sits in the low byte of its

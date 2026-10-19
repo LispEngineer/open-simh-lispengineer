@@ -437,15 +437,16 @@ extern int32 sys_model;
 
 #define DZ_L3C          1                               /* line 3 console */
 
-/* Machine specific definitions - RZ94: DMA goes through the SCSI
-   scatter/gather map, from the window address in the board's DMA address
-   register */
+/* Machine specific definitions - RZ94: the board's DMA engine (the SQWF)
+   moves the data, through the SCSI scatter/gather map, from the window
+   address in its own DMA address register; the 53C94's request reaches
+   INT_REQ<1> as a level that follows the chip's INT output */
 
 #define RZ_SCSI_ID      6                               /* initiator SCSI id */
-#define RZ_READB        Map_ReadB
-#define RZ_READW        Map_ReadW
-#define RZ_WRITEB       Map_WriteB
-#define RZ_WRITEW       Map_WriteW
+#define RZ_DMA_READ(rz,bc,buf)  sqwf_read (bc, buf)
+#define RZ_DMA_WRITE(rz,bc,buf) sqwf_write (bc, buf)
+#define RZ_DMA_DONE(rz,n)       sqwf_done (n)
+#define RZ_INT_LEVEL    1
 
 /* Function prototypes for I/O */
 
@@ -453,6 +454,9 @@ int32 Map_ReadB (uint32 ba, int32 bc, uint8 *buf);
 int32 Map_ReadW (uint32 ba, int32 bc, uint16 *buf);
 int32 Map_WriteB (uint32 ba, int32 bc, uint8 *buf);
 int32 Map_WriteW (uint32 ba, int32 bc, uint16 *buf);
+int32 sqwf_read (uint32 bc, uint8 *buf);
+int32 sqwf_write (uint32 bc, uint8 *buf);
+void sqwf_done (uint32 n);
 
 /* Function prototypes for system-specific unaligned support */
 
