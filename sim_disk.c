@@ -4327,6 +4327,9 @@ static FILE *sim_os_disk_open_raw (const char *rawdevicename, const char *openmo
 {
 int mode = 0;
 int fd;
+#ifdef O_DSYNC
+struct stat statb;
+#endif
 
 if (strchr (openmode, 'r') && (strchr (openmode, '+') || strchr (openmode, 'w')))
     mode = O_RDWR;
@@ -4337,7 +4340,12 @@ else
 mode |= O_LARGEFILE;
 #endif
 #ifdef O_DSYNC
-mode |= O_DSYNC;
+/* Write through to a device. A container in an ordinary file (which the
+   AUTO format opens as RAW when it has no footer) is cached by the host
+   like a SIMH format container: a synchronous write there stops the
+   whole simulator, clock and devices included, for the host's flush. */
+if ((stat (rawdevicename, &statb) != 0) || !S_ISREG (statb.st_mode))
+    mode |= O_DSYNC;
 #endif
 fd = open (rawdevicename, mode, 0);
 if (fd < 0)
