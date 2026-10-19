@@ -823,6 +823,7 @@ void scsi_read6_tape (SCSI_BUS *bus, uint8 *data, uint32 len)
 UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_seccnt sects, sectsread, new_buf_b;
+t_uint64 want;
 t_stat r;
 uint32 i;
 
@@ -841,6 +842,12 @@ if (sects == 0) {                                       /* no data to read */
     }
 
 scsi_debug_cmd (bus, "Read(6) blks %d fixed %d\n", sects, (data[1] & 0x1));
+
+if (data[1] & 0x1) {                                    /* fixed length blocks */
+    want = (t_uint64)sects * ((uptr->flags & SCSI_QIC) ? SCSI_QIC_BLKSZ : dev->block_size);
+    if (scsi_xfer_too_big (bus, (want > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32)want))
+        return;
+    }
 
 if (uptr->flags & UNIT_ATT) {
     if (uptr->flags & SCSI_QIC) {
@@ -875,7 +882,9 @@ if (uptr->flags & UNIT_ATT) {
             scsi_debug_cmd (bus, "Read tape blk %d, read %d, r = %d\n", sects, sectsread, r);
             }
         else {
-            r = sim_tape_rdrecf (uptr, &bus->buf[0], &sectsread, sects);
+            /* the request is a limit, not a length: a shorter record is read as
+               it is, so only what the buffer cannot hold is held back */
+            r = sim_tape_rdrecf (uptr, &bus->buf[0], &sectsread, ((sects > bus->buf_size) ? bus->buf_size : sects));
             scsi_debug_cmd (bus, "Read tape max %d, read %d, r = %d\n", sects, sectsread, r);
             if (r == MTSE_INVRL) {                          /* overlength condition */
                 scsi_debug_cmd (bus, "Overlength\n");
@@ -1032,15 +1041,25 @@ void scsi_write6_tape (SCSI_BUS *bus, uint8 *data, uint32 len)
 UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_seccnt sects;
+t_uint64 want;
 t_stat r;
 
 if (bus->phase == SCSI_CMD) {
     scsi_debug_cmd (bus, "Write(6) - CMD\n");
     memcpy (&bus->cmd[0], &data[0], 6);                 /* save current cmd */
-    sects = GETW (bus->cmd, 3) | (bus->cmd[2] << 16);
+    want = GETW (bus->cmd, 3) | (bus->cmd[2] << 16);
     if (data[1] & 0x1)                                  /* FIXED */
-        sects = sects * dev->block_size;
-    bus->buf_b = sects;
+        want = want * dev->block_size;
+    if (want == 0) {                                    /* no data to write */
+        memset (&bus->cmd[0], 0, 10);
+        scsi_status (bus, STS_OK, KEY_OK, ASC_OK);
+        return;
+        }
+    if (scsi_xfer_too_big (bus, (want > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32)want)) {
+        memset (&bus->cmd[0], 0, 10);
+        return;
+        }
+    bus->buf_b = (uint32)want;
     scsi_set_phase (bus, SCSI_DATO);                    /* data out phase next */
     scsi_set_req (bus);                                 /* request data */
     }
