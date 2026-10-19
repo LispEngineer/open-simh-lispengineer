@@ -350,15 +350,24 @@ switch (st) {
         break;
 
     case MTSE_RECE:                                     /* record in error */
-    case MTSE_INVRL:                                    /* invalid rec lnt */
-    case MTSE_IOERR:                                    /* IO error */
         scsi_status_deferred (bus, STS_CHK, KEY_OK, ASC_OK);
         break;
 
+    case MTSE_INVRL:                                    /* invalid rec lnt */
+        scsi_status_deferred (bus, STS_CHK, (KEY_OK | KEY_M_ILI), ASC_OK);
+        break;
+
+    case MTSE_UNATT:                                    /* no tape loaded */
+        scsi_status_deferred (bus, STS_CHK, KEY_NOTRDY, ASC_NOMEDIA);
+        break;
+
     case MTSE_FMT:
-    case MTSE_UNATT:
     case MTSE_EOM:                                      /* end of medium */
         scsi_status_deferred (bus, STS_CHK, (KEY_BLANK | 0x40), ASC_OK);
+        break;
+
+    case MTSE_LEOT:                                     /* logical end of tape */
+        scsi_status_deferred (bus, STS_CHK, (KEY_OK | 0x40), ASC_OK);
         break;
 
     case MTSE_BOT:                                      /* reverse into BOT */
@@ -366,7 +375,11 @@ switch (st) {
         break;
 
     case MTSE_WRP:                                      /* write protect */
-        scsi_status_deferred (bus, STS_CHK, KEY_PROT, ASC_OK);
+        scsi_status_deferred (bus, STS_CHK, KEY_PROT, ASC_WRTPROT);
+        break;
+
+    default:                                            /* IO error, runaway, anything else */
+        scsi_status_deferred (bus, STS_CHK, KEY_HWERR, ASC_OK);
         break;
         }
 
@@ -847,6 +860,7 @@ void scsi_read6_tape (SCSI_BUS *bus, uint8 *data, uint32 len)
 UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_seccnt sects, sectsread, new_buf_b;
+t_uint64 want;
 t_stat r;
 uint32 i;
 
@@ -865,6 +879,12 @@ if (sects == 0) {                                       /* no data to read */
     }
 
 scsi_debug_cmd (bus, "Read(6) blks %d fixed %d\n", sects, (data[1] & 0x1));
+
+if (data[1] & 0x1) {                                    /* fixed length blocks */
+    want = (t_uint64)sects * ((uptr->flags & SCSI_QIC) ? SCSI_QIC_BLKSZ : dev->block_size);
+    if (scsi_xfer_too_big (bus, (want > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32)want))
+        return;
+    }
 
 if (uptr->flags & UNIT_ATT) {
     if (uptr->flags & SCSI_QIC) {
@@ -897,19 +917,28 @@ if (uptr->flags & UNIT_ATT) {
         if (data[1] & 0x1) {
             r = sim_tape_rdrecf (uptr, &bus->buf[0], &sectsread, (sects * dev->block_size));
             scsi_debug_cmd (bus, "Read tape blk %d, read %d, r = %d\n", sects, sectsread, r);
+            if (r == MTSE_INVRL) {                          /* overlength condition */
+                scsi_status (bus, STS_CHK, (KEY_OK | KEY_M_ILI), ASC_OK);
+                return;                                     /* sim_tape read nothing */
+                }
             }
         else {
-            r = sim_tape_rdrecf (uptr, &bus->buf[0], &sectsread, sects);
+            /* the request is a limit, not a length: a shorter record is read as
+               it is, so only what the buffer cannot hold is held back */
+            r = sim_tape_rdrecf (uptr, &bus->buf[0], &sectsread, ((sects > bus->buf_size) ? bus->buf_size : sects));
             scsi_debug_cmd (bus, "Read tape max %d, read %d, r = %d\n", sects, sectsread, r);
             if (r == MTSE_INVRL) {                          /* overlength condition */
-                scsi_debug_cmd (bus, "Overlength\n");
-                if ((data[1] & 0x2) && (dev->block_size == 0)) { /* SILI set */
-                    scsi_debug_cmd (bus, "SILI set\n");
+                if ((data[1] & 0x2) && (dev->block_size == 0) &&  /* SILI set, block length zero: */
+                    (sectsread <= bus->buf_size)) {         /* not an error (SCSI-2, READ) */
+                    scsi_debug_cmd (bus, "Overlength, SILI set - first %d bytes\n", sects);
+                    r = sim_tape_rdrecf (uptr, &bus->buf[0], &sectsread, sectsread);
+                    if (sectsread > sects)                  /* the part that was asked for */
+                        sectsread = sects;
                     }
                 else {
-                    scsi_debug_cmd (bus, "SILI not set - check condition\n");
+                    scsi_debug_cmd (bus, "Overlength - check condition\n");
                     scsi_status (bus, STS_CHK, (KEY_OK | KEY_M_ILI), ASC_OK);
-                    return;
+                    return;                                 /* sim_tape read nothing */
                     }
                 }
             else if ((r == MTSE_OK) && (sectsread < sects)) {  /* underlength condition */
@@ -924,6 +953,8 @@ if (uptr->flags & UNIT_ATT) {
                     }
                 }
             }
+        if ((r != MTSE_OK) && (r != MTSE_RECE))         /* nothing was read? */
+            sectsread = 0;                              /* (sim_tape sets the count regardless) */
         new_buf_b = sectsread;
         }
 
@@ -932,9 +963,9 @@ if (uptr->flags & UNIT_ATT) {
         }
         scsi_tape_status (bus, r);
     }
-else {
-    memset (&bus->buf[0], 0, (sects * dev->block_size));
-    sectsread = (sects * dev->block_size);
+else {                                                  /* no tape loaded */
+    scsi_status (bus, STS_CHK, KEY_NOTRDY, ASC_NOMEDIA);
+    return;
     }
 
 if (sectsread > 0) {
@@ -1076,15 +1107,29 @@ void scsi_write6_tape (SCSI_BUS *bus, uint8 *data, uint32 len)
 UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_seccnt sects;
+t_uint64 want;
 t_stat r;
 
 if (bus->phase == SCSI_CMD) {
     scsi_debug_cmd (bus, "Write(6) - CMD\n");
+    if ((uptr->flags & UNIT_ATT) == 0) {                /* no tape loaded? */
+        scsi_status (bus, STS_CHK, KEY_NOTRDY, ASC_NOMEDIA);
+        return;
+        }
     memcpy (&bus->cmd[0], &data[0], 6);                 /* save current cmd */
-    sects = GETW (bus->cmd, 3) | (bus->cmd[2] << 16);
+    want = GETW (bus->cmd, 3) | (bus->cmd[2] << 16);
     if (data[1] & 0x1)                                  /* FIXED */
-        sects = sects * dev->block_size;
-    bus->buf_b = sects;
+        want = want * dev->block_size;
+    if (want == 0) {                                    /* no data to write */
+        memset (&bus->cmd[0], 0, 10);
+        scsi_status (bus, STS_OK, KEY_OK, ASC_OK);
+        return;
+        }
+    if (scsi_xfer_too_big (bus, (want > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32)want)) {
+        memset (&bus->cmd[0], 0, 10);
+        return;
+        }
+    bus->buf_b = (uint32)want;
     scsi_set_phase (bus, SCSI_DATO);                    /* data out phase next */
     scsi_set_req (bus);                                 /* request data */
     }
@@ -1094,13 +1139,9 @@ else if (bus->phase == SCSI_DATO) {
         sects = sects * dev->block_size;
     scsi_debug_cmd (bus, "Write(6) - DATO, bytes %d\n", sects);
 
-    if (uptr->flags & UNIT_ATT) {
-        r = sim_tape_wrrecf (uptr, &bus->buf[0], sects);
-        scsi_debug_cmd (bus, "Write(6) - DATO, r = %d\n", r);
-        scsi_tape_status (bus, r);                      /* translate status */
-        }
-    else
-        scsi_status_deferred (bus, STS_OK, KEY_OK, ASC_OK);
+    r = sim_tape_wrrecf (uptr, &bus->buf[0], sects);
+    scsi_debug_cmd (bus, "Write(6) - DATO, r = %d\n", r);
+    scsi_tape_status (bus, r);                          /* translate status */
 
     memset (&bus->cmd[0], 0, 10);                       /* clear current cmd */
     scsi_status (bus, bus->status, bus->sense_key, bus->sense_code);
@@ -1264,7 +1305,7 @@ void scsi_wrfmark (SCSI_BUS *bus, uint8 *data, uint32 len)
 UNIT *uptr = bus->dev[bus->target];
 uint32 i;
 t_seccnt sects;
-t_stat r;
+t_stat r = MTSE_OK;
 
 scsi_debug_cmd (bus, "Write Filemarks\n");
 
