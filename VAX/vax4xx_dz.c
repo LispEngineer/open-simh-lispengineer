@@ -458,9 +458,9 @@ switch ((pa >> 2) & 03) {                               /* case on PA<2:1> */
                 dz_char[line] |= (line << RBUF_V_RLINE);
                 if (dz_tdr & (1u << (TDR_V_TBR + line)))
                     dz_char[line] = dz_char[line] | RBUF_FRME;
-                dz_csr &= ~CSR_TRDY;                    /* busy until it arrives */
-                CLR_INT (DZTX);
+                dz_csr &= ~CSR_TRDY;
                 sim_debug(DBG_REG, &dz_dev, "maint char for line %d : %X\n", line, dz_char[line]);
+                break;
                 }
             sim_activate (&dz_unit[1], 0);
             }
@@ -510,17 +510,6 @@ t_stat dz_xmt_svc (UNIT *uptr)
 int32 line;
 
 line = CSR_GETTL (dz_csr);
-if (dz_csr & CSR_MAINT) {                               /* maintenance loopback? */
-    if (dz_char[line] && (dz_scnt < DZ_SILO_ALM)) {     /* char reaches the receiver silo */
-        dz_silo[dz_scnt] = (uint16)dz_char[line];
-        ++dz_scnt;
-        }
-    dz_char[line] = 0;
-    dz_update_rcvi ();                                  /* update rx intr */
-    dz_update_xmti ();                                  /* transmitter ready again */
-    SET_IRQL;
-    return SCPE_OK;
-    }
 if (SCPE_STALL != dz_putc (line, dz_tdr)) {             /* sent ok? */
     tmxr_poll_tx (&dz_desc);                            /* poll output */
     dz_update_xmti ();                                  /* update int */
@@ -587,8 +576,7 @@ void dz_update_rcvi (void)
 int32 line, c;
 TMLN *lp;
 
-if ((dz_csr & CSR_MSE) &&                               /* enabled and not */
-    ((dz_csr & CSR_MAINT) == 0)) {                      /* in loopback? */
+if (dz_csr & CSR_MSE) {                                 /* enabled? */
     for (line = 0; line < DZ_LINES; line++) {           /* poll lines */
         if (dz_scnt >= DZ_SILO_ALM)
             break;
