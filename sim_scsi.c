@@ -55,6 +55,7 @@
 #define CMD_SNDDIAG     0x1D                            /* send diagnostic */
 #define CMD_SPACE       0x11                            /* space */
 #define CMD_WRFMARK     0x10                            /* write filemarks */
+#define CMD_REASSIGN    0x07                            /* reassign blocks */
 
 #define CMD_READ6_TAPE_FIXED    0x01                    /* Fixed record size read */
 #define CMD_READ6_TAPE_SILI     0x02                    /* Suppress Incorrect Length Indicator */
@@ -84,6 +85,8 @@
 #define ASC_WRTPROT     0x27                            /* write protected */
 #define ASC_WRTERR      0x0C                            /* write error */
 #define ASC_NOMEDIA     0x3A                            /* media not present */
+#define ASC_LBAOOR      0x21                            /* logical block address out of range */
+#define ASC_INVPARM     0x26                            /* invalid field in parameter list */
 
 /* CD-ROM constants (SCSI-2, 14.1.5 and 14.2.10) */
 
@@ -1055,6 +1058,76 @@ scsi_set_phase (bus, SCSI_DATI);                        /* data in phase next */
 scsi_set_req (bus);                                     /* request to send data */
 }
 
+/* Command - Reassign Blocks (SCSI-2, direct-access devices)
+
+   The initiator sends a defect list: a four byte header, whose last two
+   bytes give the length in bytes of what follows, then one four byte logical
+   block address for each block to reassign.  The command descriptor block
+   does not say how long the list is, so it arrives in two DATA OUT phases,
+   the header and then the descriptors.
+
+   A disk image has no spare blocks to move a block to and no defects to
+   avoid: a block keeps its place, and the data in it is kept -- the standard
+   allows the data in a listed block to be altered, it does not ask for it.
+   A well formed list therefore ends in GOOD status with nothing done.  What
+   the target does check is what any target checks: the unit is there and not
+   write protected, the list is a whole number of descriptors that fits the
+   transfer buffer, and every address is on the unit. */
+
+void scsi_reassign_blocks (SCSI_BUS *bus, uint8 *data, uint32 len)
+{
+UNIT *uptr = bus->dev[bus->target];
+uint32 listlen, i;
+
+if (bus->phase == SCSI_CMD) {
+    scsi_debug_cmd (bus, "Reassign Blocks - CMD\n");
+    if ((uptr->flags & UNIT_ATT) == 0) {                /* not attached? */
+        scsi_status (bus, STS_CHK, KEY_NOTRDY, ASC_NOMEDIA);
+        return;
+        }
+    if (uptr->flags & UNIT_WPRT) {                      /* write protected? */
+        scsi_status (bus, STS_CHK, KEY_PROT, ASC_WRTPROT);
+        return;
+        }
+    memcpy (&bus->cmd[0], &data[0], 6);
+    bus->buf_b = 4;                                     /* the header first */
+    scsi_set_phase (bus, SCSI_DATO);                    /* data out phase next */
+    scsi_set_req (bus);                                 /* request data */
+    }
+else if (bus->phase == SCSI_DATO) {
+    if (bus->buf_b == 4) {                              /* the header is in */
+        listlen = GETW (bus->buf, 2);
+        scsi_debug_cmd (bus, "Reassign Blocks - DATO, list length %d\n", listlen);
+        if (listlen == 0) {                             /* nothing to reassign */
+            memset (&bus->cmd[0], 0, 10);
+            scsi_status (bus, STS_OK, KEY_OK, ASC_OK);
+            return;
+            }
+        if (((listlen & 3) != 0) ||                     /* not whole descriptors? */
+            ((4 + listlen) > bus->buf_size)) {          /* more than the buffer holds? */
+            memset (&bus->cmd[0], 0, 10);
+            scsi_status (bus, STS_CHK, KEY_ILLREQ, ASC_INVPARM);
+            return;
+            }
+        bus->buf_t = 4;                                 /* the descriptors follow the header */
+        bus->buf_b = 4 + listlen;
+        scsi_set_phase (bus, SCSI_DATO);                /* data out phase again */
+        scsi_set_req (bus);                             /* request data */
+        }
+    else {                                              /* the descriptors are in */
+        memset (&bus->cmd[0], 0, 10);
+        for (i = 4; i < bus->buf_b; i += 4) {
+            scsi_debug_cmd (bus, "Reassign Blocks - lba %d\n", GETL (bus->buf, i));
+            if ((uint32)GETL (bus->buf, i) >= uptr->capac) {   /* off the end of the unit? */
+                scsi_status (bus, STS_CHK, KEY_ILLREQ, ASC_LBAOOR);
+                return;
+                }
+            }
+        scsi_status (bus, STS_OK, KEY_OK, ASC_OK);
+        }
+    }
+}
+
 /* Command - Write (6 byte command), disk version */
 
 void scsi_write6_disk (SCSI_BUS *bus, uint8 *data, uint32 len)
@@ -1520,6 +1593,10 @@ switch (data[0]) {
         scsi_read_long (bus, data, len);
         break;
 
+    case CMD_REASSIGN:                                  /* optional */
+        scsi_reassign_blocks (bus, data, len);
+        break;
+
     case CMD_RELEASE:                                   /* mandatory */
         scsi_release_unit (bus, data, len);
         break;
@@ -1739,7 +1816,8 @@ uint32 cmd_len;
 
 cmd_len = scsi_decode_group (data[0]);
 
-if (len < cmd_len)                                      /* all command bytes received? */
+if ((bus->phase == SCSI_CMD) &&                         /* all command bytes received? */
+    (len < cmd_len))                                    /* (data out phases pass their length) */
     return 0;                                           /* no, need more */
 bus->status = STS_OK;
 
