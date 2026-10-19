@@ -137,7 +137,7 @@
 #define CSR_ADDR        0x3FFFFFFC                      /* CSR3, 4, 7 */
 #define CSR9_RW         0x7FC07FC0                      /* watchdog timers */
 #define CSR13_RW        0x000000FF
-#define CSR10_REV       0x00000000                      /* revision <20:16> (value: guess) */
+#define CSR10_REV       0x00040000                      /* revision 4 in <19:16> (see sgec_rd) */
 
 /* Descriptors */
 
@@ -651,9 +651,9 @@ switch (rg) {
         val = (sgec_csr[6] & CSR6_RW) | CSR6_MBO;
         break;
 
-    case 10:
-        val = CSR10_REV | (sgec_csr[10] & 0xFFFF);
-        break;
+    case 10:                                            /* revision, missed frames */
+        val = CSR10_REV | (sgec_csr[10] & 0xFFFF);      /* VMS's EZDRIVER accepts revision 3 or 4 */
+        break;                                          /* only (and loads extra data into a 3) */
 
     default:
         val = sgec_csr[rg];
