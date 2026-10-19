@@ -437,6 +437,13 @@ extern int32 sys_model;
 
 #define DZ_L3C          1                               /* line 3 console */
 
+/* Machine specific definitions - SGEC: the request goes to IRQ_H<0> (IPL
+   14), whatever IPL the SGEC's CSR0 names */
+
+#define SGECBASE        0x20008000                      /* SGEC CSRs */
+#define SGEC_SET_INT    SET_INT (NI)
+#define SGEC_CLR_INT    CLR_INT (NI)
+
 /* Machine specific definitions - RZ94: the board's DMA engine (the SQWF)
    moves the data, through the SCSI scatter/gather map, from the window
    address in its own DMA address register; the 53C94's request reaches

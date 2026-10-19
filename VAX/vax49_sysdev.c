@@ -45,6 +45,7 @@
 */
 
 #include "vax_defs.h"
+#include "vax_sgec.h"
 
 #ifdef DONT_USE_INTERNAL_ROM
 #define BOOT_CODE_FILENAME "ka49a.bin"
@@ -480,6 +481,11 @@ switch (lvl) {
     case IPL_CLK:                                       /* interval timer */
         tmr_int = 0;
         return SCB_INTTIM;
+
+    case 0x14:                                          /* SGEC: its programmed vector; */
+        if (int_req[IPL_NI] & INT_NI)                   /* the request is a level, cleared */
+            return sgec_vector ();                      /* through its CSR5 */
+        return 0;
 
     case 0x15:                                          /* board devices */
         pend = int_pending () & int_mask_expanded ();
@@ -1481,79 +1487,6 @@ int32 b = nar_rd (pa) & 0xFF;
 return (int32) (0xFF00FF00u | ((uint32) b << 16) | (uint32) b);
 }
 
-/* SGEC placeholder (2000.8000).  The Ethernet controller is a separate
-   device still to be written.  Until then the model answers its sixteen
-   CSRs as a chip that holds what is written to it (with the bits the
-   console's register test expects to be writable) and that fails its own
-   self-test: after a reset (CSR6<31>) it reports initialisation done with
-   CSR5<30> (self-test failed) set and status 1 in CSR5<29:26>.  The
-   console's NI test then fails cleanly at its initialisation step instead
-   of taking a machine check from an absent device, which no console code
-   expects at this address. */
-
-#define NIP_CSRS        16
-#define NIP_SIZE        (NIP_CSRS << 2)
-#define NIP_BASE        0x20008000
-#define NIP_CSR0_MBO    0x1FFF0003                      /* CSR0 bits that read as one */
-#define NIP_CSR5_ID     0x80000000                      /* initialisation done */
-#define NIP_CSR5_SF     0x40000000                      /* self-test failed */
-#define NIP_CSR5_SS     0x04000000                      /* self-test status 1 */
-#define NIP_CSR5_DN     0x00010000                      /* virtual CSR access done */
-#define NIP_CSR6_RESET  0x80000000
-
-static const uint32 nip_mask[NIP_CSRS] = {             /* writable bits, from the console's register test */
-    0xE000FFFC, 0x00000000, 0x00000000, 0x3FFFFFFC,
-    0x3FFFFFFC, 0x00000000, 0x7E080FCE, 0x3FFFFFFC,
-    0x00000000, 0x7FC07FC0, 0x00000000, 0xFFFFFFFF,
-    0xFFFFFFFF, 0x000000FF, 0x00000000, 0xFFFFFFFF
-    };
-uint32 nip_csr[NIP_CSRS] = { 0 };
-
-int32 nip_rd (int32 pa)
-{
-int32 rg = ((pa - NIP_BASE) >> 2) & (NIP_CSRS - 1);
-
-switch (rg) {
-
-    case 0:
-        return (int32) ((nip_csr[0] & nip_mask[0]) | NIP_CSR0_MBO);
-
-    case 1: case 2:                                     /* poll demands: write only */
-        return (int32) 0xFFFFFFFF;
-
-    case 5:
-        return (int32) (nip_csr[5] | NIP_CSR5_DN);
-
-    default:
-        return (int32) nip_csr[rg];
-        }
-}
-
-void nip_wr (int32 pa, int32 val, int32 lnt)
-{
-int32 rg = ((pa - NIP_BASE) >> 2) & (NIP_CSRS - 1);
-
-switch (rg) {
-
-    case 5:                                             /* status: write 1 to clear */
-        nip_csr[5] = nip_csr[5] & ~(((uint32) val) & 0x000000FF);
-        break;
-
-    case 6:
-        if (val & NIP_CSR6_RESET) {                     /* reset: self-test fails */
-            nip_csr[5] = NIP_CSR5_ID | NIP_CSR5_SF | NIP_CSR5_SS;
-            nip_csr[6] = 0;
-            }
-        else
-            nip_csr[6] = ((uint32) val) & nip_mask[6];
-        break;
-
-    default:
-        nip_csr[rg] = ((uint32) val) & nip_mask[rg];
-        break;
-        }
-}
-
 /* Audio placeholder (2680.0000).  The AM79C30A is not modelled.  The
    console's AUD test only plays tones through it (it writes the chip's
    indirect registers and reads the interrupt register once), so the model
@@ -1607,7 +1540,7 @@ struct reglink {                                        /* register linkage */
     };
 
 struct reglink regtable[] = {
-    { NIP_BASE, NIP_BASE+NIP_SIZE, &nip_rd, &nip_wr },
+    { SGECBASE, SGECBASE+SGEC_CSRSIZE, &sgec_rd, &sgec_wr },
     { ROMBASE, ROMBASE+ROMSIZE, &rom_rd, NULL },
     { XIPRBASE, XIPRBASE+XIPRSIZE, &xipr_rd, &xipr_wr },
     { OBITBASE, OBITBASE+OBITSIZE, &obit_rd, &obit_wr },
