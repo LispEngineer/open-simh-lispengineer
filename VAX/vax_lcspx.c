@@ -176,7 +176,8 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
 #define SP_MPC          0x21FC                          /* a write starts the microcode */
 #define SP_FG           0x2260
 #define SP_BG           0x2264
-#define SP_DESTLOOP     0x2270                          /* <3:0> logical function */
+#define SP_DESTLOOP     0x2270                          /* <3:0> logical function, <31:16> variant */
+#define SP_PLANE        0x219C                          /* copy plane: the source bit(s) */
 
 #define SP_CLIPMIN      0x21C0                          /* clip rectangle: <31:16> y, <15:0> x */
 #define SP_CLIPMAX      0x21C4                          /* (exclusive) */
@@ -184,12 +185,18 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
 #define CMD_XNEG        0x00000001
 #define CMD_YNEG        0x00000002
 #define CMD_CLIP        0x00000020                      /* clip to CLIPMIN..CLIPMAX */
+#define CMD_TRAP        0x00008000                      /* fill a trapezoid */
+#define SP_DXL          0x23C8                          /* trapezoid: XSTART's edge step */
+#define SP_DXR          0x23CC                          /* XEND's edge step */
 #define CMD_WRMASK      0x00020000                      /* SRCMASK masks the writes */
 #define CMD_RDMASK      0x00040000                      /* SRCMASK masks the destination read */
 #define CMD_SRCMASK     0x01000000                      /* DSTMASK masks the source read */
 #define PIX_INDEX       0x00FFFFFF
 #define MPC_FILL        0x2019                          /* fill a rectangle with FG */
 #define MPC_COPY        0x201A                          /* copy a rectangle */
+#define MPC_VECTOR      0x2099                          /* draw a vector */
+#define CMD_NOFIRST     0x00000800                      /* vector: leave out the first point */
+#define CMD_NOLAST      0x00000400                      /* vector: leave out the last point */
 #define SP_PMCTL        0x316C                          /* plane mask control */
 #define SP_WRMASK       0x3170                          /* write plane mask */
 #define SP_RDMASK       0x3174                          /* read plane mask */
@@ -740,8 +747,9 @@ switch (port) {
    microcode does at the entry points the option ROM and NetBSD's spx
    driver start (the microprogram counter, 21FC), from the registers they
    set up first:
-        2019    fill the rectangle with FG
+        2019    fill the rectangle with FG (with COMMAND<15>: a trapezoid)
         201A    copy a rectangle from SRCPIX
+        2099    draw a vector
    The rectangle's edges are XSTART..XEND and YSTART..YEND (pixels, in
    <31:16>); COMMAND<0> and <1> draw right to left and bottom to top, the
    columns from XEND to XSTART - 1 and the rows from YEND to YSTART - 1.
@@ -754,7 +762,11 @@ switch (port) {
    COMMAND<17> it masks what is written, with COMMAND<18> it masks the
    destination before the logical function (subtest 20); with
    COMMAND<24> DSTMASK (21F4) masks the copied source pixels (subtest 23).
-   (The names are NetBSD's.)  With COMMAND<5>
+   (The names are NetBSD's.)  DESTLOOP<31:16> selects a variant of the
+   copy: 0011 copies pixels; 2012 (the option ROM, subtest 24) and 2014
+   (NetBSD's character drawing) copy a plane: a source pixel with any of
+   the bits of 219C (its part of the longword mask) set gives FG, else BG.
+   With COMMAND<5>
    only the
    pixels inside the clip rectangle are drawn: CLIPMIN (21C0) inclusive
    to CLIPMAX (21C4) exclusive, y in <31:16> and x in <15:0> (subtest
@@ -844,6 +856,9 @@ uint32 lmask = sp_reg (SP_SRCMASK);                     /* over a frame-buffer l
 uint32 smask = sp_reg (SP_DSTMASK);                     /* the same, for the source */
 uint32 dbase = sp_reg (SP_DSTPIX) & PIX_INDEX, sbase = sp_reg (SP_SRCPIX) & PIX_INDEX;
 uint32 fg = sp_reg (SP_FG) & pmask;
+uint32 bg = sp_reg (SP_BG) & pmask;
+uint32 variant = sp_reg (SP_DESTLOOP) >> 16;
+t_bool plane = copy && (((variant & 0xF) == 2) || ((variant & 0xF) == 4));
 t_bool clip = (cmd & CMD_CLIP)? TRUE: FALSE;
 int32 cx0 = sp_reg (SP_CLIPMIN) & 0xFFFF, cy0 = sp_reg (SP_CLIPMIN) >> 16;
 int32 cx1 = sp_reg (SP_CLIPMAX) & 0xFFFF, cy1 = sp_reg (SP_CLIPMAX) >> 16;
@@ -866,6 +881,8 @@ for (r = 0; r < h; r++) {
             src = fb_getpix (idx, depth);
             if (cmd & CMD_SRCMASK)
                 src = src & (smask >> (((idx << depth) & 3) << 3));
+            if (plane)                                  /* expand the plane */
+                src = (src & (sp_reg (SP_PLANE) >> (((idx << depth) & 3) << 3)) & pmask)? fg: bg;
             }
         else src = fg;
         idx = dbase + x + y * dstride;
@@ -880,6 +897,179 @@ for (r = 0; r < h; r++) {
 return w * h;
 }
 
+/* Fill a trapezoid (COMMAND<15> with the fill entry; subtest 26)
+
+   The trapezoid lies between two edges, XSTART and XEND, from row
+   YSTART to row YEND, all 16.16 fixed point; 23C8 and 23CC are the
+   edges' steps per row.  Each row is filled from the left edge's integer
+   part up to, not including, the right edge's.  COMMAND<0> says XEND's
+   edge is the left one, COMMAND<1> that the rows go upwards (and the
+   first row is then the one above YSTART).
+
+   An edge steps as the option ROM's own check of the drawing computes
+   it, which is not a plain fixed-point addition: the step's fraction is
+   added to the edge's, and the carry goes into the integer part; but
+   after a step that carried, the next step subtracts instead a fraction
+   taken from YSTART<15:0> (the left edge) or YEND<15:0> (the right
+   edge), and adds one more to the integer part unless that borrows.
+   The fractions in YSTART and YEND are thus the edges' error terms.
+   The real board passes the check, so this is taken to be what its
+   microcode does; it is the least certain part of the model. */
+
+typedef struct {
+    uint32      f;                                      /* fraction */
+    int32       i;                                      /* integer part */
+    int32       si;                                     /* step: integer part */
+    uint32      sf;                                     /* step: fraction */
+    uint32      adj;                                    /* the fraction after a carry */
+    t_bool      carried;
+    } SP_EDGE;
+
+static void sp_edge_init (SP_EDGE *e, uint32 x, uint32 step, uint32 adj)
+{
+e->f = x & 0xFFFF;
+e->i = (int16) (x >> 16);
+e->sf = step & 0xFFFF;
+e->si = (int16) (step >> 16);
+e->adj = adj & 0xFFFF;
+e->carried = FALSE;
+}
+
+static void sp_edge_step (SP_EDGE *e)
+{
+uint32 t;
+
+if (!e->carried) {
+    t = e->f + e->sf;
+    e->carried = (t & 0xFFFF0000)? TRUE: FALSE;
+    }
+else {
+    t = e->f - e->adj;
+    e->carried = (t & 0xFFFF0000)? FALSE: TRUE;
+    }
+e->f = t & 0xFFFF;
+e->i = e->i + e->si + (e->carried? 1: 0);
+}
+
+static int32 sp_trap (void)
+{
+uint32 cmd = sp_reg (SP_COMMAND);
+uint32 depth = sp_reg (SP_DSTPIX) >> 30;
+uint32 pmask = (depth == 0)? 0xFF: ((depth == 1)? 0xFFFF: 0xFFFFFFFF);
+int32 stride = (int32) (sp_reg (SP_STRIDE) & 0xFFFF);
+uint32 fn = sp_reg (SP_DESTLOOP) & 0xF;
+uint32 fg = sp_reg (SP_FG) & pmask;
+uint32 base = sp_reg (SP_DSTPIX) & PIX_INDEX;
+int32 x0 = (int16) (sp_reg (SP_XSTART) >> 16), y0 = (int16) (sp_reg (SP_YSTART) >> 16);
+int32 y1 = (int16) (sp_reg (SP_YEND) >> 16);
+int32 h = y1 - y0, dy = 1, row = y0, r, x, n = 0;
+uint32 idx;
+SP_EDGE le, re;
+
+if (cmd & CMD_XNEG) {
+    sp_edge_init (&le, sp_reg (SP_XEND), sp_reg (SP_DXR), sp_reg (SP_YSTART));
+    sp_edge_init (&re, sp_reg (SP_XSTART), sp_reg (SP_DXL), sp_reg (SP_YEND));
+    }
+else {
+    sp_edge_init (&le, sp_reg (SP_XSTART), sp_reg (SP_DXL), sp_reg (SP_YSTART));
+    sp_edge_init (&re, sp_reg (SP_XEND), sp_reg (SP_DXR), sp_reg (SP_YEND));
+    }
+sim_debug (DBG_SP, &lcspx_dev, "trapezoid edges %d/%d rows %d..%d cmd %08X fn %X\n", le.i, re.i, y0, y1, cmd, fn);
+if (h < 0) {                                            /* upwards */
+    h = -h;
+    dy = -1;
+    sp_edge_step (&le);
+    sp_edge_step (&re);
+    row = y0 - 1;
+    }
+for (r = 0; r < h; r++, row = row + dy) {
+    for (x = le.i; x < re.i; x++, n++) {
+        idx = base + (x - x0) + (row - y0) * stride;    /* DSTPIX is the pixel at (XSTART, YSTART) */
+        fb_putpix (idx, depth, sp_logic (fn, fg, fb_getpix (idx, depth)) & pmask);
+        }
+    sp_edge_step (&le);
+    sp_edge_step (&re);
+    }
+return n;
+}
+
+/* Draw a vector (entry 2099; subtest 27)
+
+   From (XSTART, YSTART) to (XEND, YEND), integer parts, the points that
+   Bresenham's algorithm gives, as the option ROM's check computes them:
+   the line is taken left to right (the end points, and with them
+   COMMAND<11> and <10>, exchanged if need be), mirrored to go downwards,
+   and with x and y exchanged when it is steep; the error term starts at
+   2 dy - dx - 1, a point moves the minor axis while the term is not
+   negative.  COMMAND<11> leaves out the first point, COMMAND<10> the
+   last.  Each point takes the logical function of FG and the pixel. */
+
+static int32 sp_vector (void)
+{
+uint32 cmd = sp_reg (SP_COMMAND);
+uint32 depth = sp_reg (SP_DSTPIX) >> 30;
+uint32 pmask = (depth == 0)? 0xFF: ((depth == 1)? 0xFFFF: 0xFFFFFFFF);
+int32 stride = (int32) (sp_reg (SP_STRIDE) & 0xFFFF);
+uint32 fn = sp_reg (SP_DESTLOOP) & 0xF;
+uint32 fg = sp_reg (SP_FG) & pmask;
+uint32 base = sp_reg (SP_DSTPIX) & PIX_INDEX;
+int32 ox = (int16) (sp_reg (SP_XSTART) >> 16), oy = (int16) (sp_reg (SP_YSTART) >> 16);
+int32 x0 = ox, y0 = oy;
+int32 x1 = (int16) (sp_reg (SP_XEND) >> 16), y1 = (int16) (sp_reg (SP_YEND) >> 16);
+t_bool nofirst = (cmd & CMD_NOFIRST)? TRUE: FALSE, nolast = (cmd & CMD_NOLAST)? TRUE: FALSE;
+t_bool yneg = FALSE, steep = FALSE, tb;
+int32 dx, dy, e, maj, min, last, t, n = 0, px, py;
+uint32 idx;
+
+dx = x1 - x0;
+if (dx < 0) {                                           /* left to right */
+    dx = -dx;
+    t = x0; x0 = x1; x1 = t;
+    t = y0; y0 = y1; y1 = t;
+    tb = nofirst; nofirst = nolast; nolast = tb;
+    }
+dy = y1 - y0;
+if (dy < 0) {                                           /* downwards */
+    dy = -dy;
+    y0 = -y0;
+    y1 = -y1;
+    yneg = TRUE;
+    }
+if (dy > dx) {                                          /* steep: exchange the axes */
+    t = dx; dx = dy; dy = t;
+    t = x0; x0 = y0; y0 = t;
+    t = x1; x1 = y1; y1 = t;
+    steep = TRUE;
+    }
+e = 2 * dy - dx - 1;
+sim_debug (DBG_SP, &lcspx_dev, "vector (%d,%d) to (%d,%d) cmd %08X fn %X\n",
+    ox, oy, (int16) (sp_reg (SP_XEND) >> 16), (int16) (sp_reg (SP_YEND) >> 16), cmd, fn);
+last = nolast? x1 - 1: x1;
+for (maj = x0, min = y0; maj <= last; ) {
+    if ((maj != x0) || !nofirst) {
+        if (steep) {
+            px = min;
+            py = yneg? -maj: maj;
+            }
+        else {
+            px = maj;
+            py = yneg? -min: min;
+            }
+        idx = base + (px - ox) + (py - oy) * stride;
+        fb_putpix (idx, depth, sp_logic (fn, fg, fb_getpix (idx, depth)) & pmask);
+        n++;
+        }
+    maj++;
+    if (e < 0)
+        e = e + 2 * dy;
+    else {
+        min++;
+        e = e + 2 * dy - 2 * dx;
+        }
+    }
+return n;
+}
+
 /* The microprogram counter was written: run the operation */
 
 #define SP_DONE_MIN     50                              /* instructions to "done", at least */
@@ -892,11 +1082,15 @@ int32 n = 0;
 switch (mpc & 0xFFFF) {
 
     case MPC_FILL:
-        n = sp_rect (FALSE);
+        n = (sp_reg (SP_COMMAND) & CMD_TRAP)? sp_trap (): sp_rect (FALSE);
         break;
 
     case MPC_COPY:
         n = sp_rect (TRUE);
+        break;
+
+    case MPC_VECTOR:
+        n = sp_vector ();
         break;
 
     default:
