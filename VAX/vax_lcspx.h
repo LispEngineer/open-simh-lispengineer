@@ -37,6 +37,9 @@
 
 #define LCSPX_FB        0x00000000                      /* frame buffer, one byte per pixel */
 #define LCSPX_FBSIZE    0x00400000                      /* 4 MB: "8 Plane 4Mpixel FB" */
+#define LCSPX_CMD       0x01000000                      /* command windows into the TBC FIFOs */
+#define LCSPX_CMDSTEP   0x00400000                      /* one per FIFO */
+#define LCSPX_CMDSIZE   0x00300000
 #define LCSPX_SP        0x01300000                      /* scan processor (pixel engine) */
 #define LCSPX_SPSIZE    0x00100000                      /* 512 KB, and a diagnostic view */
 #define LCSPX_TBC       0x01B00000                      /* TBC: timing and bus controller */

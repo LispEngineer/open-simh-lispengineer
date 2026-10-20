@@ -49,8 +49,12 @@
    3800.0000):
 
         000.0000 - 03F.FFFF     frame buffer, one byte per pixel
+        100.0000 - 12F.FFFF     FIFO 0's command window
         130.0000 - 13F.FFFF     scan processor (13 8000 up: its
                                 diagnostic view)
+        140.0000 - 16F.FFFF     FIFO 1's command window
+        180.0000 - 1AF.FFFF     FIFO 2's command window
+        1C0.0000 - 1EF.FFFF     FIFO 3's command window
         1B0.0000 - 1B0.03FF     TBC
         1B1.0000                Bt459 address register, low byte
         1B1.4000                Bt459 address register, high byte
@@ -174,7 +178,21 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
         +4      write pointer <13:2>: where the next entry goes
         +8      read pointer <13:2>: the oldest entry
         +C      free space <14:2>: 1000 when empty
-   Writing a one to bit k of +00C resets FIFO k: both pointers 0, empty. */
+   Writing a one to bit k of +00C resets FIFO k: both pointers 0, empty.
+
+   A longword write into FIFO k's command window (offset w from the
+   option's 100.0000) appends two entries: an address entry, 1000000 | w,
+   and the data.  The FIFO keeps a tag with each entry (the data may have
+   bit 24 set too).  While the FIFO's routing is enabled in the TBC's
+   +004 (bit 3 + 5k; FIFO 3: bit 19; subtest 12) the TBC takes the
+   entries and writes each datum to the register its address entry names,
+   advancing the address by four for further data.  Within the FIFO's
+   window:
+        20.0000 - 23.FFFF       the TBC's space: its registers, the
+                                Bt459, the FIFO memory (1B0.0000 up;
+                                subtests 12 and 13)
+   With routing disabled the entries wait, and the CPU can see them in the
+   FIFO memory. */
 
 #define TBC_CVINTMSK    (0x014 >> 2)                    /* CVAX interrupt mask */
 #define TBC_CVINTSTS    (0x018 >> 2)                    /* CVAX interrupt status */
@@ -203,10 +221,16 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
 #define FIFO_N          4                               /* FIFOs */
 #define FIFO_DEPTH      4096                            /* entries */
 #define FIFO_BLOCK      (0x8000 >> 2)                   /* FIFO memory per FIFO, longwords */
+#define TBC_ROUTE       (0x004 >> 2)                    /* FIFO routing */
+#define FIFO_ADDR       0x01000000                      /* an address entry */
+#define CMD_TBC         0x00200000                      /* command address: TBC space */
+#define CMD_TBCSIZE     0x00040000
 #define TBC_LINE_USEC   13.0                            /* one line, 1280 x 1024 at 72 Hz */
 
 static uint32 lcspx_fifomem[LCSPX_FIFOSIZE >> 2];       /* FIFO memory */
+static uint8 lcspx_fifotag[LCSPX_FIFOSIZE >> 2];        /* 1: an address entry */
 static uint32 fifo_wp[FIFO_N], fifo_rp[FIFO_N], fifo_cnt[FIFO_N];
+static uint32 fifo_dest[FIFO_N];                        /* where the next datum goes */
 static uint32 tbc_line = 0;                             /* line counter */
 static double tbc_tlast = 0;                            /* sim time of the line's start */
 
@@ -244,8 +268,10 @@ static uint8 bt_cur[16];                                /* 300-30F */
 static uint8 bt_curram[1024];                           /* 400-7FF */
 
 t_stat lcspx_reset (DEVICE *dptr);
+static void lcspx_wroff (uint32 off, int32 pa, int32 val, int32 lnt);
 static void tbc_advance (void);
 static uint32 tbc_rd (int32 i);
+static void tbc_wr (int32 i, uint32 nv, uint32 wv);
 t_stat lcspx_attach (UNIT *uptr, CONST char *cptr);
 t_stat lcspx_detach (UNIT *uptr);
 t_stat lcspx_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *cptr);
@@ -379,25 +405,72 @@ while (now - tbc_tlast >= ipl) {
 
 /* TBC FIFOs */
 
-static void fifo_put (int32 k, uint32 v)
+static void fifo_put (int32 k, uint32 v, t_bool addr)
 {
 if (fifo_cnt[k] >= FIFO_DEPTH)                          /* full: lost */
     return;
 lcspx_fifomem[k * FIFO_BLOCK + fifo_wp[k]] = v;
+lcspx_fifotag[k * FIFO_BLOCK + fifo_wp[k]] = addr? 1: 0;
 fifo_wp[k] = (fifo_wp[k] + 1) & (FIFO_DEPTH - 1);
 fifo_cnt[k]++;
 }
 
-static uint32 fifo_get (int32 k)
+static uint32 fifo_get (int32 k, t_bool *addr)
 {
 uint32 v;
 
-if (fifo_cnt[k] == 0)                                   /* empty */
+if (fifo_cnt[k] == 0) {                                 /* empty */
+    *addr = FALSE;
     return 0;
+    }
 v = lcspx_fifomem[k * FIFO_BLOCK + fifo_rp[k]];
+*addr = lcspx_fifotag[k * FIFO_BLOCK + fifo_rp[k]]? TRUE: FALSE;
 fifo_rp[k] = (fifo_rp[k] + 1) & (FIFO_DEPTH - 1);
 fifo_cnt[k]--;
 return v;
+}
+
+/* Is FIFO k's routing enabled? */
+
+static t_bool fifo_routed (int32 k)
+{
+return (lcspx_tbc[TBC_ROUTE] & (1u << ((k < 3)? (3 + 5 * k): 19)))? TRUE: FALSE;
+}
+
+/* Carry out one datum taken from a FIFO */
+
+static void cmd_write (uint32 a, uint32 v)
+{
+a = a % LCSPX_CMDSTEP;                                  /* the address within the FIFO's window */
+if ((a - CMD_TBC) < CMD_TBCSIZE)                        /* TBC registers, Bt459, FIFO memory */
+    lcspx_wroff (LCSPX_TBC + (a - CMD_TBC), (int32) a, (int32) v, L_LONG);
+else sim_debug (DBG_REG, &lcspx_dev, "command to %06X = %08X not modelled\n", a, v);
+}
+
+/* Let the TBC take the entries of every routed FIFO */
+
+static void fifo_drain (void)
+{
+static t_bool busy = FALSE;                             /* a routed write can route more */
+t_bool addr;
+int32 k;
+uint32 v;
+
+if (busy)
+    return;
+busy = TRUE;
+for (k = 0; k < FIFO_N; k++) {
+    while (fifo_routed (k) && (fifo_cnt[k] > 0)) {
+        v = fifo_get (k, &addr);
+        if (addr)
+            fifo_dest[k] = v & 0x00FFFFFC;
+        else {
+            cmd_write (fifo_dest[k], v);
+            fifo_dest[k] = (fifo_dest[k] + 4) & 0x00FFFFFC;
+            }
+        }
+    }
+busy = FALSE;
 }
 
 /* Read a TBC register */
@@ -406,13 +479,14 @@ static uint32 tbc_rd (int32 i)
 {
 int32 k = (i - TBC_FIFO0) / TBC_FIFOSTEP;
 uint32 v;
+t_bool addr;
 
 tbc_advance ();
 if ((i >= TBC_FIFO0) && (k < FIFO_N) && (((i - TBC_FIFO0) % TBC_FIFOSTEP) < 4)) {
     switch ((i - TBC_FIFO0) % TBC_FIFOSTEP) {
 
         case 0:                                         /* data: take the oldest */
-            return fifo_get (k);
+            return fifo_get (k, &addr);
 
         case 1:                                         /* write pointer */
             return fifo_wp[k] << 2;
@@ -442,7 +516,8 @@ if ((i >= TBC_FIFO0) && (k < FIFO_N) && (((i - TBC_FIFO0) % TBC_FIFOSTEP) < 4)) 
     switch ((i - TBC_FIFO0) % TBC_FIFOSTEP) {
 
         case 0:                                         /* data: append */
-            fifo_put (k, nv);
+            fifo_put (k, nv, FALSE);
+            fifo_drain ();
             break;
 
         default:                                        /* pointers: read only */
@@ -470,6 +545,11 @@ switch (i) {
             tbc_tlast = sim_gtime ();
             }
         lcspx_tbc[i] = nv & ~TCSR_RO;
+        break;
+
+    case TBC_ROUTE:                                     /* routing: may start a FIFO */
+        lcspx_tbc[i] = nv;
+        fifo_drain ();
         break;
 
     default:
@@ -698,11 +778,18 @@ return 0;
 
 void lcspx_wr (int32 pa, int32 val, int32 lnt)
 {
-uint32 off = ((uint32) pa) - LCSPX_BASE;
-uint32 i;
-
 if (lcspx_dev.flags & DEV_DIS)
     return;
+lcspx_wroff (((uint32) pa) - LCSPX_BASE, pa, val, lnt);
+}
+
+/* Write at an offset in the option's window, for the CPU or for the
+   TBC's command path (pa gives the byte lanes of a short write) */
+
+static void lcspx_wroff (uint32 off, int32 pa, int32 val, int32 lnt)
+{
+uint32 i;
+
 if (off < LCSPX_FBSIZE) {                               /* frame buffer */
     sim_debug (DBG_FB, &lcspx_dev, "FB write %06X = %08X (%d)\n", off, val, lnt);
     if (lnt >= L_LONG) {
@@ -720,6 +807,17 @@ if (off < LCSPX_FBSIZE) {                               /* frame buffer */
     else lcspx_fb[off] = val & 0xFF;
     return;
     }
+if (((off - LCSPX_CMD) < (FIFO_N * LCSPX_CMDSTEP)) &&   /* a FIFO's command window */
+    (((off - LCSPX_CMD) % LCSPX_CMDSTEP) < LCSPX_CMDSIZE)) {
+    i = (off - LCSPX_CMD) / LCSPX_CMDSTEP;
+    sim_debug (DBG_REG, &lcspx_dev, "FIFO %d command %06X = %08X (%d), PC %08X\n", i, off - LCSPX_CMD, val, lnt, fault_PC);
+    if (lnt >= L_LONG) {
+        fifo_put (i, FIFO_ADDR | ((off - LCSPX_CMD) & 0x00FFFFFC), TRUE);
+        fifo_put (i, val, FALSE);
+        fifo_drain ();
+        }
+    return;
+    }
 if ((off - LCSPX_SP) < LCSPX_SPSIZE) {                  /* scan processor */
     sim_debug (DBG_REG, &lcspx_dev, "SP write %05X = %08X (%d), PC %08X\n", off - LCSPX_SP, val, lnt, fault_PC);
     sp_wr ((off - LCSPX_SP) & ~3u, pa, val, lnt);
@@ -735,6 +833,7 @@ if ((off - LCSPX_FIFO) < LCSPX_FIFOSIZE) {              /* FIFO memory */
     i = (off - LCSPX_FIFO) >> 2;
     sim_debug (DBG_REG, &lcspx_dev, "FIFO memory write %05X = %08X (%d), PC %08X\n", off - LCSPX_FIFO, val, lnt, fault_PC);
     lcspx_fifomem[i] = lcspx_merge (lcspx_fifomem[i], pa, val, lnt);
+    lcspx_fifotag[i] = 0;
     return;
     }
 if ((off - LCSPX_BT) < LCSPX_BTSIZE) {                  /* Bt459 */
@@ -767,6 +866,8 @@ memset (lcspx_fifomem, 0, sizeof (lcspx_fifomem));
 memset (fifo_wp, 0, sizeof (fifo_wp));
 memset (fifo_rp, 0, sizeof (fifo_rp));
 memset (fifo_cnt, 0, sizeof (fifo_cnt));
+memset (fifo_dest, 0, sizeof (fifo_dest));
+memset (lcspx_fifotag, 0, sizeof (lcspx_fifotag));
 bt_addr = bt_m3 = 0;
 return SCPE_OK;
 }
