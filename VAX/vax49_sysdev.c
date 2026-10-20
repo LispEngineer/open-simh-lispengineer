@@ -1692,20 +1692,24 @@ return;
 
    The handler acknowledges with MTPR #0, #MCESR.  A machine check while
    the processor is still taking one is a double error: console halt with
-   code 05.  ISTATE2 and Q are left zero (the model has no microcode
-   state to report). */
+   code 05.  VA is the virtual address of the reference, saved before the
+   frame is written (each write of the frame moves mchk_va); ISTATE2 gives
+   the opcode and the mode the reference was made in; Rn, VR and Q are
+   left zero (the model has no microcode state to report). */
 
 int32 machine_check (int32 p1, int32 opc, int32 cc, int32 delta)
 {
-int32 istate1, acc, saved_pc = PC;
+int32 istate1, istate2, acc, saved_pc = PC;
+uint32 va = (uint32) mchk_va;                           /* before the frame's writes move it */
 
 if (in_ie) {
     in_ie = 0;
     sim_debug (DBG_MCHK, &sysd_dev, "double error: machine check code %02X at PC %08X\n", p1, PC);
     return con_halt (CON_DBLMCK, cc);                   /* double machine check */
     }
-sim_debug (DBG_MCHK, &sysd_dev, "machine check code %02X, VA %08X, PC %08X\n", p1, mchk_va, PC);
+sim_debug (DBG_MCHK, &sysd_dev, "machine check code %02X, VA %08X, PC %08X\n", p1, va, PC);
 istate1 = ((ASTLVL & 07) << 29) | ((p1 & 0xFF) << 16) | (ka_cpuid & 0xFF);
+istate2 = (((PSL >> PSL_V_CUR) & 3) << 24) | ((opc & 0xFF) << 16);
 cc = intexc (SCB_MCHK, cc, 0, IE_SVE);                  /* take exception */
 acc = ACC_MASK (KERN);                                  /* in kernel mode */
 in_ie = 1;
@@ -1714,9 +1718,9 @@ Write (SP, 0x18, L_LONG, WA);                           /* # bytes */
 Write (SP + 4, istate1, L_LONG, WA);                    /* ISTATE1 */
 Write (SP + 8, ka_intsys, L_LONG, WA);                  /* INT.SYS */
 Write (SP + 12, saved_pc, L_LONG, WA);                  /* SAVEPC */
-Write (SP + 16, mchk_va, L_LONG, WA);                   /* VA */
+Write (SP + 16, va, L_LONG, WA);                        /* VA */
 Write (SP + 20, 0, L_LONG, WA);                         /* Q */
-Write (SP + 24, (opc & 0xFF) << 16, L_LONG, WA);        /* ISTATE2 */
+Write (SP + 24, istate2, L_LONG, WA);                   /* ISTATE2 */
 in_ie = 0;
 ka_mchk_busy = 1;
 return cc;
