@@ -105,11 +105,15 @@ int32 sys_model = 0;                                    /* no graphics console *
    <7:6>    memory set 0 (0A-0D): <6> present, <7> 16 MB SIMMs (else 4 MB)
    <9:8>    memory set 1 (1E-1H): the same
    <13:10>  SIMM faults
+   <15:14>  not driven: read as ones
+
+   The register is a word; a longword read gives it in both halves.  The
+   real 4000/90 read C3CEC3CE (console E/P/L 2580.0000, 2026-10-20).
 
    The model has the LCSPX graphics, as both real machines it was compared
    with do, so <1> is set, with <3> because the console is the serial line
    (no monitor); for
-   128 MB the register reads 03CE.  VMS needs <1>: with it clear, VMS
+   128 MB the register holds 03CE (C3CE as read).  VMS needs <1>: with it clear, VMS
    reports HW_MODEL 378, "Unknown VAXstation 4000-90", and the licence
    manager calls the CPU configuration unsupported; with it set, HW_MODEL
    376 and "VAXstation 4000-90", as on the real machines (found by
@@ -1214,11 +1218,16 @@ switch (rg) {
 
 extern int32 tmr_poll;                                  /* instructions per 10 ms */
 
+#define CFG_UNDRIVEN    0xC000                          /* <15:14> read as ones */
+
 int32 cfg_rd (int32 pa)
 {
+int32 w;
+
 if (pa & 4)                                             /* LED */
     return ka_led & 0xFF;
-return ka_cfg & 0xFFFF;
+w = CFG_UNDRIVEN | (ka_cfg & 0x3FFF);
+return (w << 16) | w;                                   /* the word in both halves */
 }
 
 void cfg_wr (int32 pa, int32 val, int32 lnt)
