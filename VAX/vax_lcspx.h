@@ -42,6 +42,8 @@
 #define LCSPX_TBC       0x01B00000                      /* TBC: timing and bus controller */
 #define LCSPX_TBCSIZE   0x00000400
 #define LCSPX_BT        0x01B10000                      /* Bt459 RAMDAC: four ports */
+#define LCSPX_FIFO      0x01B20000                      /* TBC FIFO memory */
+#define LCSPX_FIFOSIZE  0x00020000
 #define LCSPX_BTSIZE    0x00010000
 #define LCSPX_ROM       0x01BC0000                      /* option ROM */
 #define LCSPX_ROMSIZE   0x00040000                      /* 16 bits wide, longword stride */

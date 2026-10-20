@@ -56,6 +56,7 @@
         1B1.4000                Bt459 address register, high byte
         1B1.8000                Bt459 register port
         1B1.C000                Bt459 colour map port
+        1B2.0000 - 1B3.FFFF     TBC FIFO memory
         1BC.0000 - 1BF.FFFF     option ROM: 16 bits wide at a longword
                                 stride, bits <31:16> read C000
 
@@ -99,6 +100,14 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
    diagnostic view of it.  In the normal view:
         2100-21FC, 2200-22FC    the register file: register i (0-63) is
                                 at 2200 + 4i for i < 32, else 2100 + 4i
+        212C                    microcode address <25:16> and the
+                                microword's bits <47:32>; reads give the
+                                address and bits <47:32> of the word
+                                there (subtest 9)
+        23F8                    the microword's bits <31:0>: a write
+                                stores the 48-bit word at the address
+   The microcode RAM holds 1024 48-bit words; the console loads it at
+   power-up (the option's init routine) and the scan processor runs it.
    In the diagnostic view (+80000) the option ROM's self-test (subtests 7
    and 8) needs:
         2100-22FC               the register file, as in the normal view
@@ -113,9 +122,17 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
    what the self-test checks. */
 
 #define SP_DIAG         0x00080000                      /* the diagnostic view */
+#define SP_UCADDR       0x212C                          /* microcode address, bits <47:32> */
+#define SP_UCDATA       0x23F8                          /* microcode bits <31:0> */
+#define SP_UCSIZE       1024                            /* microcode words */
 #define SP_LANEDIAG     0x2000                          /* lanes view */
 #define SP_BYTEREG      0x2300                          /* register file by byte lane */
 #define SP_INVMEM       0xA000                          /* complemented memory */
+
+static uint32 sp_ucaddr = 0;                            /* microcode address */
+static uint32 sp_uchi = 0;                              /* microword <47:32>, as written */
+static uint32 sp_uclo[SP_UCSIZE];                       /* microcode RAM <31:0> */
+static uint16 sp_ucmhi[SP_UCSIZE];                      /* microcode RAM <47:32> */
 
 /* The normal-view offset of register i of the register file */
 
@@ -147,7 +164,17 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
         +114    VBS, vertical blank start
         +116    VBF, vertical blank finish: the frame's last line
    CVAX interrupt status (+018): <3> VBS reached, <4> VBF reached, both
-   latched; writing ones clears them. */
+   latched; writing ones clears them.
+
+   The TBC has four FIFOs of 4096 longwords (subtests 10 and 11).  FIFO k
+   (0-3) keeps its entries in the FIFO memory at 1B2.0000 + 8000k, which
+   the CPU can also read and write directly, and has four registers at
+   +040 + 20k:
+        +0      data: a write appends an entry, a read takes the oldest
+        +4      write pointer <13:2>: where the next entry goes
+        +8      read pointer <13:2>: the oldest entry
+        +C      free space <14:2>: 1000 when empty
+   Writing a one to bit k of +00C resets FIFO k: both pointers 0, empty. */
 
 #define TBC_CVINTMSK    (0x014 >> 2)                    /* CVAX interrupt mask */
 #define TBC_CVINTSTS    (0x018 >> 2)                    /* CVAX interrupt status */
@@ -169,8 +196,17 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
 #define CVI_W1C         0xFFFFFFFF                      /* every status bit: write one to clear */
 
 #define TBC_VMASK       0x7FF                           /* vertical fields: 11 bits */
+
+#define TBC_FIFORST     (0x00C >> 2)                    /* <3:0> reset FIFO 3-0 */
+#define TBC_FIFO0       (0x040 >> 2)                    /* FIFO 0's data port */
+#define TBC_FIFOSTEP    (0x020 >> 2)                    /* to the next FIFO's */
+#define FIFO_N          4                               /* FIFOs */
+#define FIFO_DEPTH      4096                            /* entries */
+#define FIFO_BLOCK      (0x8000 >> 2)                   /* FIFO memory per FIFO, longwords */
 #define TBC_LINE_USEC   13.0                            /* one line, 1280 x 1024 at 72 Hz */
 
+static uint32 lcspx_fifomem[LCSPX_FIFOSIZE >> 2];       /* FIFO memory */
+static uint32 fifo_wp[FIFO_N], fifo_rp[FIFO_N], fifo_cnt[FIFO_N];
 static uint32 tbc_line = 0;                             /* line counter */
 static double tbc_tlast = 0;                            /* sim time of the line's start */
 
@@ -209,6 +245,7 @@ static uint8 bt_curram[1024];                           /* 400-7FF */
 
 t_stat lcspx_reset (DEVICE *dptr);
 static void tbc_advance (void);
+static uint32 tbc_rd (int32 i);
 t_stat lcspx_attach (UNIT *uptr, CONST char *cptr);
 t_stat lcspx_detach (UNIT *uptr);
 t_stat lcspx_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *cptr);
@@ -340,16 +377,91 @@ while (now - tbc_tlast >= ipl) {
     }
 }
 
+/* TBC FIFOs */
+
+static void fifo_put (int32 k, uint32 v)
+{
+if (fifo_cnt[k] >= FIFO_DEPTH)                          /* full: lost */
+    return;
+lcspx_fifomem[k * FIFO_BLOCK + fifo_wp[k]] = v;
+fifo_wp[k] = (fifo_wp[k] + 1) & (FIFO_DEPTH - 1);
+fifo_cnt[k]++;
+}
+
+static uint32 fifo_get (int32 k)
+{
+uint32 v;
+
+if (fifo_cnt[k] == 0)                                   /* empty */
+    return 0;
+v = lcspx_fifomem[k * FIFO_BLOCK + fifo_rp[k]];
+fifo_rp[k] = (fifo_rp[k] + 1) & (FIFO_DEPTH - 1);
+fifo_cnt[k]--;
+return v;
+}
+
+/* Read a TBC register */
+
+static uint32 tbc_rd (int32 i)
+{
+int32 k = (i - TBC_FIFO0) / TBC_FIFOSTEP;
+uint32 v;
+
+tbc_advance ();
+if ((i >= TBC_FIFO0) && (k < FIFO_N) && (((i - TBC_FIFO0) % TBC_FIFOSTEP) < 4)) {
+    switch ((i - TBC_FIFO0) % TBC_FIFOSTEP) {
+
+        case 0:                                         /* data: take the oldest */
+            return fifo_get (k);
+
+        case 1:                                         /* write pointer */
+            return fifo_wp[k] << 2;
+
+        case 2:                                         /* read pointer */
+            return fifo_rp[k] << 2;
+
+        default:                                        /* free space */
+            return (FIFO_DEPTH - fifo_cnt[k]) << 2;
+            }
+    }
+v = lcspx_tbc[i];
+if (i == TBC_TCSR)
+    v = (v & ~TCSR_RO) | ((tbc_line & 1)? TCSR_V0: 0) | (tbc_in_vsync ()? TCSR_VS: 0);
+return v;
+}
+
 /* Write a TBC register: nv is the register's new value, wv the bits the
    write carried (for the write-one-to-clear status registers) */
 
 static void tbc_wr (int32 i, uint32 nv, uint32 wv)
 {
+int32 k = (i - TBC_FIFO0) / TBC_FIFOSTEP;
+
 tbc_advance ();
+if ((i >= TBC_FIFO0) && (k < FIFO_N) && (((i - TBC_FIFO0) % TBC_FIFOSTEP) < 4)) {
+    switch ((i - TBC_FIFO0) % TBC_FIFOSTEP) {
+
+        case 0:                                         /* data: append */
+            fifo_put (k, nv);
+            break;
+
+        default:                                        /* pointers: read only */
+            break;
+            }
+    return;
+    }
 switch (i) {
 
     case TBC_CVINTSTS:                                  /* status: write one to clear */
         lcspx_tbc[i] &= ~(wv & CVI_W1C);
+        break;
+
+    case TBC_FIFORST:                                   /* FIFO resets */
+        for (k = 0; k < FIFO_N; k++) {
+            if (wv & (1u << k))
+                fifo_wp[k] = fifo_rp[k] = fifo_cnt[k] = 0;
+            }
+        lcspx_tbc[i] = nv;
         break;
 
     case TBC_TCSR:
@@ -482,6 +594,10 @@ if (o & SP_DIAG) {                                      /* diagnostic view */
     else if ((n >= SP_INVMEM) && (n < SP_INVMEM + 0x140))
         return ~lcspx_sp[n >> 2];
     }
+else if (n == SP_UCADDR)
+    return (sp_ucaddr << 16) | sp_ucmhi[sp_ucaddr];
+else if (n == SP_UCDATA)
+    return sp_uclo[sp_ucaddr];
 return lcspx_sp[n >> 2];
 }
 
@@ -502,6 +618,17 @@ if (o & SP_DIAG) {                                      /* diagnostic view */
         sp_lanes[i] = ~lanes;
         n = sp_regoff (i);
         }
+    }
+else if (n == SP_UCADDR) {
+    i = lcspx_merge ((sp_ucaddr << 16) | sp_uchi, pa, val, lnt);
+    sp_ucaddr = (i >> 16) & (SP_UCSIZE - 1);
+    sp_uchi = i & 0xFFFF;
+    return;
+    }
+else if (n == SP_UCDATA) {
+    sp_uclo[sp_ucaddr] = lcspx_merge (sp_uclo[sp_ucaddr], pa, val, lnt);
+    sp_ucmhi[sp_ucaddr] = (uint16) sp_uchi;
+    return;
     }
 lcspx_sp[n >> 2] = lcspx_merge (lcspx_sp[n >> 2], pa, val, lnt);
 }
@@ -541,11 +668,13 @@ if ((off - LCSPX_SP) < LCSPX_SPSIZE) {                  /* scan processor */
     return (int32) v;
     }
 if ((off - LCSPX_TBC) < LCSPX_TBCSIZE) {                /* TBC */
-    tbc_advance ();
-    v = lcspx_tbc[(off - LCSPX_TBC) >> 2];
-    if (((off - LCSPX_TBC) >> 2) == TBC_TCSR)
-        v = (v & ~TCSR_RO) | ((tbc_line & 1)? TCSR_V0: 0) | (tbc_in_vsync ()? TCSR_VS: 0);
+    v = tbc_rd ((off - LCSPX_TBC) >> 2);
     sim_debug (DBG_REG, &lcspx_dev, "TBC read %03X = %08X, PC %08X\n", off - LCSPX_TBC, v, fault_PC);
+    return (int32) v;
+    }
+if ((off - LCSPX_FIFO) < LCSPX_FIFOSIZE) {              /* FIFO memory */
+    v = lcspx_fifomem[(off - LCSPX_FIFO) >> 2];
+    sim_debug (DBG_REG, &lcspx_dev, "FIFO memory read %05X = %08X, PC %08X\n", off - LCSPX_FIFO, v, fault_PC);
     return (int32) v;
     }
 if ((off - LCSPX_BT) < LCSPX_BTSIZE) {                  /* Bt459: one port per 16 KB */
@@ -602,6 +731,12 @@ if ((off - LCSPX_TBC) < LCSPX_TBCSIZE) {                /* TBC */
     tbc_wr (i, lcspx_merge (lcspx_tbc[i], pa, val, lnt), lcspx_merge (0, pa, val, lnt));
     return;
     }
+if ((off - LCSPX_FIFO) < LCSPX_FIFOSIZE) {              /* FIFO memory */
+    i = (off - LCSPX_FIFO) >> 2;
+    sim_debug (DBG_REG, &lcspx_dev, "FIFO memory write %05X = %08X (%d), PC %08X\n", off - LCSPX_FIFO, val, lnt, fault_PC);
+    lcspx_fifomem[i] = lcspx_merge (lcspx_fifomem[i], pa, val, lnt);
+    return;
+    }
 if ((off - LCSPX_BT) < LCSPX_BTSIZE) {                  /* Bt459 */
     i = (off - LCSPX_BT) >> 14;
     if (lnt < L_LONG)                                   /* the data lane is <7:0> */
@@ -624,9 +759,14 @@ if (lcspx_fb == NULL) {
     }
 memset (lcspx_sp, 0, sizeof (lcspx_sp));
 memset (sp_lanes, 0, sizeof (sp_lanes));
+sp_ucaddr = sp_uchi = 0;
 memset (lcspx_tbc, 0, sizeof (lcspx_tbc));
 tbc_line = 0;
 tbc_tlast = sim_gtime ();
+memset (lcspx_fifomem, 0, sizeof (lcspx_fifomem));
+memset (fifo_wp, 0, sizeof (fifo_wp));
+memset (fifo_rp, 0, sizeof (fifo_rp));
+memset (fifo_cnt, 0, sizeof (fifo_cnt));
 bt_addr = bt_m3 = 0;
 return SCPE_OK;
 }
