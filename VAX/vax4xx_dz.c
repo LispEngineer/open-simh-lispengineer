@@ -50,13 +50,15 @@
 #define CSR_MAINT       0x0008                          /* maint - NI */
 #define CSR_CLR         0x0010                          /* clear */
 #define CSR_MSE         0x0020                          /* master scan enb */
+#define CSR_RIE         0x0040                          /* rcv int enb (see dz_int_level) */
 #define CSR_RDONE       0x0080                          /* rcv done - RO */
 #define CSR_V_TLINE     8                               /* xmit line - RO */
 #define CSR_TLINE       (DZ_LNOMASK << CSR_V_TLINE)
 #define CSR_SAE         0x1000                          /* silo alm enb */
 #define CSR_SA          0x2000                          /* silo alm - RO */
+#define CSR_TIE         0x4000                          /* xmit int enb (see dz_int_level) */
 #define CSR_TRDY        0x8000                          /* xmit rdy - RO */
-#define CSR_RW          (CSR_MAINT | CSR_MSE | CSR_SAE)
+#define CSR_RW          (CSR_MAINT | CSR_MSE | CSR_RIE | CSR_SAE | CSR_TIE)
 #define CSR_MBZ         (0xC07 | CSR_CLR)
 
 #define CSR_GETTL(x)    (((x) >> CSR_V_TLINE) & DZ_LNOMASK)
@@ -67,13 +69,13 @@ BITFIELD dz_csr_bits[] = {
     BIT(MAINT),                                         /* Maint */
     BIT(CLR),                                           /* clear */
     BIT(MSE),                                           /* naster scan enable */
-    BITNCF(1),                                          /* not used */
+    BIT(RIE),                                           /* receive interrupt enable */
     BIT(RDONE),                                         /* receive done */
     BITF(TLINE,2),                                      /* transmit line */
     BITNCF(2),                                          /* not used */
     BIT(SAE),                                           /* silo alarm enable */
     BIT(SA),                                            /* silo alarm */
-    BITNCF(1),                                          /* not used */
+    BIT(TIE),                                           /* transmit interrupt enable */
     BIT(TRDY),                                          /* transmit ready */
     ENDBITS
     };
@@ -243,6 +245,7 @@ uint16 dz_getc (void);
 t_stat dz_putc (int32 line, uint16 data);
 void dz_update_rcvi (void);
 void dz_update_xmti (void);
+int32 dz_int_level (void);
 t_stat dz_set_log (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
 t_stat dz_set_nolog (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
 t_stat dz_show_log (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
@@ -671,6 +674,27 @@ if (dz_csr & CSR_TRDY)                                  /* ready? */
 else
     CLR_INT (DZTX);                                     /* no int req */
 return;
+}
+
+/* The receive and transmit requests as a DZ11 raises them: receive while
+   RIE is set and RDONE (or, with SAE, the silo alarm) is set, transmit
+   while TIE and TRDY are set.  The requests stay asserted as long as the
+   controller wants service.  For a system whose interrupt controller
+   takes the DC7085's requests as levels; the SET_INT/CLR_INT requests
+   above remain what the other systems use.
+
+   Returns bit 0 for a receive request, bit 1 for a transmit request. */
+
+int32 dz_int_level (void)
+{
+int32 lvl = 0;
+
+if ((dz_csr & CSR_RIE) &&
+    ((dz_csr & CSR_SAE)? (dz_csr & CSR_SA): (dz_csr & CSR_RDONE)))
+    lvl |= 1;
+if ((dz_csr & CSR_TIE) && (dz_csr & CSR_TRDY))
+    lvl |= 2;
+return lvl;
 }
 
 /* Device reset */
