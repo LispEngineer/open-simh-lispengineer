@@ -38,7 +38,7 @@
 #define LCSPX_FB        0x00000000                      /* frame buffer, one byte per pixel */
 #define LCSPX_FBSIZE    0x00400000                      /* 4 MB: "8 Plane 4Mpixel FB" */
 #define LCSPX_SP        0x01300000                      /* scan processor (pixel engine) */
-#define LCSPX_SPSIZE    0x00010000
+#define LCSPX_SPSIZE    0x00100000                      /* 512 KB, and a diagnostic view */
 #define LCSPX_TBC       0x01B00000                      /* TBC: timing and bus controller */
 #define LCSPX_TBCSIZE   0x00000400
 #define LCSPX_BT        0x01B10000                      /* Bt459 RAMDAC: four ports */

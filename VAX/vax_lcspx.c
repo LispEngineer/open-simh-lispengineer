@@ -49,7 +49,8 @@
    3800.0000):
 
         000.0000 - 03F.FFFF     frame buffer, one byte per pixel
-        130.0000 - 130.FFFF     scan processor
+        130.0000 - 13F.FFFF     scan processor (13 8000 up: its
+                                diagnostic view)
         1B0.0000 - 1B0.03FF     TBC
         1B1.0000                Bt459 address register, low byte
         1B1.4000                Bt459 address register, high byte
@@ -89,11 +90,125 @@
 
 static uint16 *lcspx_rom = NULL;                        /* option ROM, one word per longword */
 static uint8 *lcspx_fb = NULL;                          /* frame buffer */
-static uint32 lcspx_sp[LCSPX_SPSIZE >> 2];              /* scan processor registers */
+static uint32 lcspx_sp[LCSPX_SPSIZE >> 3];              /* scan processor space */
+static uint32 sp_lanes[64];                             /* diagnostic view: lanes not written */
+
+/* Scan processor
+
+   The scan processor's space is 512 KB; the second 512 KB is a
+   diagnostic view of it.  In the normal view:
+        2100-21FC, 2200-22FC    the register file: register i (0-63) is
+                                at 2200 + 4i for i < 32, else 2100 + 4i
+   In the diagnostic view (+80000) the option ROM's self-test (subtests 7
+   and 8) needs:
+        2100-22FC               the register file, as in the normal view
+        2300 + 4i               register i, one byte lane at a time
+        2000 + 4i               reads the complement of the byte lanes
+                                that the last write through 2300 + 4i
+                                carried; writable
+        6000-613F               the same memory as in the normal view
+        A000-A13F               reads the complement of what was written
+   What these views are for in the hardware (the register file is built
+   from byte-sliced chips) is not established; the model gives exactly
+   what the self-test checks. */
+
+#define SP_DIAG         0x00080000                      /* the diagnostic view */
+#define SP_LANEDIAG     0x2000                          /* lanes view */
+#define SP_BYTEREG      0x2300                          /* register file by byte lane */
+#define SP_INVMEM       0xA000                          /* complemented memory */
+
+/* The normal-view offset of register i of the register file */
+
+static uint32 sp_regoff (uint32 i)
+{
+return (i < 32)? (0x2200 + 4 * i): (0x2100 + 4 * i);
+}
 static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
-static uint32 lcspx_bt[4];                              /* Bt459 ports */
+
+/* TBC: timing and bus controller
+
+   The TBC generates the video timing.  A line counter runs while the
+   timing CSR's RUN bit is set; it counts the lines of a frame from 0 and
+   wraps at the vertical blank finish line.  The registers below are the
+   ones the option ROM's self-test gives a meaning (subtests 3 and 4);
+   the rest are plain read/write registers.
+
+   Timing CSR (+100):
+        <2:0>   requests that the TBC carries out at the next vertical
+                blank finish, and then clears, while <3> is set; with
+                <3> clear they stay set (subtest 4)
+        <3>     REQEN: carry out the requests at vertical blank finish
+        <5>     RUN: the line counter runs
+        <17>    V0: bit 0 of the line counter (read only)
+        <18>    VS: in vertical sync (read only)
+   Vertical timing, 11-bit fields, in lines from the start of a frame:
+        +110    VSS, vertical sync start
+        +112    VSF, vertical sync finish
+        +114    VBS, vertical blank start
+        +116    VBF, vertical blank finish: the frame's last line
+   CVAX interrupt status (+018): <3> VBS reached, <4> VBF reached, both
+   latched; writing ones clears them. */
+
+#define TBC_CVINTMSK    (0x014 >> 2)                    /* CVAX interrupt mask */
+#define TBC_CVINTSTS    (0x018 >> 2)                    /* CVAX interrupt status */
+#define TBC_GRINTMSK    (0x024 >> 2)                    /* graphic interrupt mask */
+#define TBC_GRINTSTS    (0x028 >> 2)                    /* graphic interrupt status */
+#define TBC_TCSR        (0x100 >> 2)                    /* timing CSR */
+#define TBC_VSYNC       (0x110 >> 2)                    /* VSS <10:0>, VSF <26:16> */
+#define TBC_VBLANK      (0x114 >> 2)                    /* VBS <10:0>, VBF <26:16> */
+
+#define TCSR_REQ        0x00000007                      /* requests done at VBF */
+#define TCSR_REQEN      0x00000008                      /* ... while this is set */
+#define TCSR_RUN        0x00000020                      /* timing runs */
+#define TCSR_V0         0x00020000                      /* line counter <0> */
+#define TCSR_VS         0x00040000                      /* in vertical sync */
+#define TCSR_RO         (TCSR_V0 | TCSR_VS)
+
+#define CVI_VBS         0x00000008                      /* vertical blank start */
+#define CVI_VBF         0x00000010                      /* vertical blank finish */
+#define CVI_W1C         0xFFFFFFFF                      /* every status bit: write one to clear */
+
+#define TBC_VMASK       0x7FF                           /* vertical fields: 11 bits */
+#define TBC_LINE_USEC   13.0                            /* one line, 1280 x 1024 at 72 Hz */
+
+static uint32 tbc_line = 0;                             /* line counter */
+static double tbc_tlast = 0;                            /* sim time of the line's start */
+
+/* Bt459 RAMDAC
+
+   Four ports, one per 16 KB of the option's window, data on bits <7:0>:
+        0       address register <7:0>
+        1       address register <11:8>
+        2       the register the address selects
+        3       the colour map entry the address selects
+   The 12-bit address register increments after each access to a single
+   register, and after the third access (red, green, blue: the modulo-3
+   counter) to a colour map entry, an overlay colour (100-10F) or a
+   cursor colour (181-183); loading either half of it resets the counter.
+   Brooktree's Bt459 data sheet gives the register set:
+        000-0FF colour map (port 3)     200     ID, reads 4A
+        100-10F overlay colours         201-203 command registers 0-2
+        181-183 cursor colours          204     pixel read mask
+        300-30C cursor and window       206     pixel blink mask
+                command and position    208-209 overlay read, blink masks
+        400-7FF cursor RAM              20A     interleave
+                                        20B     test
+                                        20C-20E signature (red, green, blue) */
+
+#define BT_ID           0x4A                            /* Bt459 identification */
+#define BT_AMASK        0xFFF                           /* address register */
+
+static uint32 bt_addr = 0;                              /* address register */
+static uint32 bt_m3 = 0;                                /* modulo-3 counter */
+static uint8 bt_cmap[256][3];                           /* colour map */
+static uint8 bt_ovl[16][3];                             /* overlay colours */
+static uint8 bt_curcol[3][3];                           /* cursor colours */
+static uint8 bt_reg[16];                                /* 200-20F */
+static uint8 bt_cur[16];                                /* 300-30F */
+static uint8 bt_curram[1024];                           /* 400-7FF */
 
 t_stat lcspx_reset (DEVICE *dptr);
+static void tbc_advance (void);
 t_stat lcspx_attach (UNIT *uptr, CONST char *cptr);
 t_stat lcspx_detach (UNIT *uptr);
 t_stat lcspx_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *cptr);
@@ -110,7 +225,9 @@ UNIT lcspx_unit = { UDATA (NULL, UNIT_ATTABLE + UNIT_RO, 0) };
 
 REG lcspx_reg[] = {
     { BRDATAD (TBC,   lcspx_tbc, 16, 32, LCSPX_TBCSIZE >> 2, "TBC registers") },
-    { BRDATAD (BT459, lcspx_bt,  16, 32, 4, "Bt459 ports") },
+    { HRDATAD (BTADDR, bt_addr, 12, "Bt459 address register") },
+    { BRDATAD (BTREG, bt_reg, 16, 8, 16, "Bt459 registers 200-20F") },
+    { BRDATAD (BTCUR, bt_cur, 16, 8, 16, "Bt459 cursor registers 300-30F") },
     { NULL }
     };
 
@@ -150,6 +267,245 @@ mask = ((lnt == L_BYTE)? 0xFFu: 0xFFFFu) << sc;
 return (old & ~mask) | (((uint32) val << sc) & mask);
 }
 
+/* TBC video timing */
+
+static uint32 tbc_field (int32 reg, int32 hi)
+{
+return (lcspx_tbc[reg] >> (hi? 16: 0)) & TBC_VMASK;
+}
+
+static t_bool tbc_in_vsync (void)
+{
+return (lcspx_tbc[TBC_TCSR] & TCSR_RUN) &&
+    (tbc_line >= tbc_field (TBC_VSYNC, 0)) && (tbc_line < tbc_field (TBC_VSYNC, 1));
+}
+
+/* One line period in instructions, from the calibrated instruction rate
+   (at least a few instructions, so that a polling loop sees every line) */
+
+static double tbc_line_instr (void)
+{
+double ipl = sim_timer_inst_per_sec () * TBC_LINE_USEC / 1000000.0;
+
+return (ipl < 16.0)? 16.0: ipl;
+}
+
+/* At vertical blank finish the TBC carries out the requests in the
+   timing CSR */
+
+static void tbc_vbf_reqs (void)
+{
+if (lcspx_tbc[TBC_TCSR] & TCSR_REQEN)
+    lcspx_tbc[TBC_TCSR] &= ~TCSR_REQ;
+}
+
+/* Bring the line counter up to the present, latching the vertical blank
+   events it passes */
+
+static void tbc_advance (void)
+{
+double now = sim_gtime ();
+double ipl;
+uint32 n, vbs, vbf;
+
+if ((lcspx_tbc[TBC_TCSR] & TCSR_RUN) == 0) {
+    tbc_tlast = now;
+    return;
+    }
+ipl = tbc_line_instr ();
+if (now - tbc_tlast < ipl)
+    return;
+vbs = tbc_field (TBC_VBLANK, 0);
+vbf = tbc_field (TBC_VBLANK, 1);
+if (vbf == 0)                                           /* a frame is at least one line */
+    vbf = 1;
+if ((now - tbc_tlast) >= (ipl * (vbf + 1))) {           /* a whole frame or more: every event */
+    n = (uint32) ((now - tbc_tlast) / ipl);
+    lcspx_tbc[TBC_CVINTSTS] |= CVI_VBS | CVI_VBF;
+    tbc_vbf_reqs ();
+    tbc_line = (tbc_line + n) % (vbf + 1);
+    tbc_tlast = tbc_tlast + n * ipl;
+    return;
+    }
+while (now - tbc_tlast >= ipl) {
+    tbc_tlast = tbc_tlast + ipl;
+    if (tbc_line >= vbf) {                              /* past the last line: a new frame */
+        tbc_line = 0;
+        lcspx_tbc[TBC_CVINTSTS] |= CVI_VBF;
+        tbc_vbf_reqs ();
+        }
+    else tbc_line++;
+    if (tbc_line == vbs)
+        lcspx_tbc[TBC_CVINTSTS] |= CVI_VBS;
+    }
+}
+
+/* Write a TBC register: nv is the register's new value, wv the bits the
+   write carried (for the write-one-to-clear status registers) */
+
+static void tbc_wr (int32 i, uint32 nv, uint32 wv)
+{
+tbc_advance ();
+switch (i) {
+
+    case TBC_CVINTSTS:                                  /* status: write one to clear */
+        lcspx_tbc[i] &= ~(wv & CVI_W1C);
+        break;
+
+    case TBC_TCSR:
+        if ((nv & TCSR_RUN) && !(lcspx_tbc[i] & TCSR_RUN)) {    /* starts: line 0 */
+            tbc_line = 0;
+            tbc_tlast = sim_gtime ();
+            }
+        lcspx_tbc[i] = nv & ~TCSR_RO;
+        break;
+
+    default:
+        lcspx_tbc[i] = nv;
+        break;
+        }
+}
+
+/* Bt459: the colour triple at an address, or NULL for a single register */
+
+static uint8 *bt_triple (uint32 a, t_bool cmap)
+{
+if (cmap)
+    return bt_cmap[a & 0xFF];
+if ((a >= 0x100) && (a <= 0x10F))
+    return bt_ovl[a - 0x100];
+if ((a >= 0x181) && (a <= 0x183))
+    return bt_curcol[a - 0x181];
+return NULL;
+}
+
+/* The single register at an address */
+
+static uint8 *bt_single (uint32 a)
+{
+static uint8 none;
+
+if ((a >= 0x200) && (a <= 0x20F))
+    return &bt_reg[a - 0x200];
+if ((a >= 0x300) && (a <= 0x30F))
+    return &bt_cur[a - 0x300];
+if ((a >= 0x400) && (a <= 0x7FF))
+    return &bt_curram[a - 0x400];
+none = 0;                                               /* reserved: reads zero */
+return &none;
+}
+
+/* Step the address after an access to a triple or a single register */
+
+static void bt_step (t_bool triple)
+{
+if (triple) {
+    if (++bt_m3 < 3)
+        return;
+    bt_m3 = 0;
+    }
+bt_addr = (bt_addr + 1) & BT_AMASK;
+}
+
+static uint32 bt_rd (uint32 port)
+{
+uint8 *t;
+uint32 v;
+
+switch (port) {
+
+    case 0:                                             /* address <7:0> */
+        return bt_addr & 0xFF;
+
+    case 1:                                             /* address <11:8> */
+        return (bt_addr >> 8) & 0xF;
+
+    case 2:                                             /* register */
+    case 3:                                             /* colour map */
+        t = bt_triple (bt_addr, port == 3);
+        if (t != NULL) {
+            v = t[bt_m3];
+            bt_step (TRUE);
+            return v;
+            }
+        if (bt_addr == 0x200)                           /* ID */
+            v = BT_ID;
+        else v = *bt_single (bt_addr);
+        bt_step (FALSE);
+        return v;
+        }
+return 0;
+}
+
+static void bt_wr (uint32 port, uint32 v)
+{
+uint8 *t;
+
+switch (port) {
+
+    case 0:                                             /* address <7:0> */
+        bt_addr = (bt_addr & 0xF00) | v;
+        bt_m3 = 0;
+        break;
+
+    case 1:                                             /* address <11:8> */
+        bt_addr = (bt_addr & 0x0FF) | ((v & 0xF) << 8);
+        bt_m3 = 0;
+        break;
+
+    case 2:                                             /* register */
+    case 3:                                             /* colour map */
+        t = bt_triple (bt_addr, port == 3);
+        if (t != NULL) {
+            t[bt_m3] = (uint8) v;
+            bt_step (TRUE);
+            break;
+            }
+        if (bt_addr != 0x200)                           /* the ID is read only */
+            *bt_single (bt_addr) = (uint8) v;
+        bt_step (FALSE);
+        break;
+        }
+}
+
+/* Scan processor space: o is the longword's offset in the space */
+
+static uint32 sp_rd (uint32 o)
+{
+uint32 n = o & (SP_DIAG - 1);
+
+if (o & SP_DIAG) {                                      /* diagnostic view */
+    if ((n >= SP_LANEDIAG) && (n < SP_LANEDIAG + 0x100))
+        return sp_lanes[(n - SP_LANEDIAG) >> 2];
+    if ((n >= SP_BYTEREG) && (n < SP_BYTEREG + 0x100))
+        n = sp_regoff ((n - SP_BYTEREG) >> 2);
+    else if ((n >= SP_INVMEM) && (n < SP_INVMEM + 0x140))
+        return ~lcspx_sp[n >> 2];
+    }
+return lcspx_sp[n >> 2];
+}
+
+static void sp_wr (uint32 o, int32 pa, int32 val, int32 lnt)
+{
+uint32 n = o & (SP_DIAG - 1);
+uint32 i, lanes;
+
+if (o & SP_DIAG) {                                      /* diagnostic view */
+    if ((n >= SP_LANEDIAG) && (n < SP_LANEDIAG + 0x100)) {
+        i = (n - SP_LANEDIAG) >> 2;
+        sp_lanes[i] = lcspx_merge (sp_lanes[i], pa, val, lnt);
+        return;
+        }
+    if ((n >= SP_BYTEREG) && (n < SP_BYTEREG + 0x100)) {
+        i = (n - SP_BYTEREG) >> 2;
+        lanes = lcspx_merge (0, pa, -1, lnt);           /* the lanes this write carries */
+        sp_lanes[i] = ~lanes;
+        n = sp_regoff (i);
+        }
+    }
+lcspx_sp[n >> 2] = lcspx_merge (lcspx_sp[n >> 2], pa, val, lnt);
+}
+
 /* Read the option's window
 
    Inputs:
@@ -180,18 +536,21 @@ if ((off - LCSPX_ROM) < LCSPX_ROMSIZE) {                /* option ROM */
     return (int32) v;
     }
 if ((off - LCSPX_SP) < LCSPX_SPSIZE) {                  /* scan processor */
-    v = lcspx_sp[(off - LCSPX_SP) >> 2];
-    sim_debug (DBG_REG, &lcspx_dev, "SP read %04X = %08X, PC %08X\n", off - LCSPX_SP, v, fault_PC);
+    v = sp_rd ((off - LCSPX_SP) & ~3u);
+    sim_debug (DBG_REG, &lcspx_dev, "SP read %05X = %08X, PC %08X\n", off - LCSPX_SP, v, fault_PC);
     return (int32) v;
     }
 if ((off - LCSPX_TBC) < LCSPX_TBCSIZE) {                /* TBC */
+    tbc_advance ();
     v = lcspx_tbc[(off - LCSPX_TBC) >> 2];
+    if (((off - LCSPX_TBC) >> 2) == TBC_TCSR)
+        v = (v & ~TCSR_RO) | ((tbc_line & 1)? TCSR_V0: 0) | (tbc_in_vsync ()? TCSR_VS: 0);
     sim_debug (DBG_REG, &lcspx_dev, "TBC read %03X = %08X, PC %08X\n", off - LCSPX_TBC, v, fault_PC);
     return (int32) v;
     }
 if ((off - LCSPX_BT) < LCSPX_BTSIZE) {                  /* Bt459: one port per 16 KB */
-    v = lcspx_bt[(off - LCSPX_BT) >> 14];
-    sim_debug (DBG_REG, &lcspx_dev, "Bt459 read port %d = %08X, PC %08X\n", (off - LCSPX_BT) >> 14, v, fault_PC);
+    v = bt_rd ((off - LCSPX_BT) >> 14);
+    sim_debug (DBG_REG, &lcspx_dev, "Bt459 read port %d = %02X, PC %08X\n", (off - LCSPX_BT) >> 14, v, fault_PC);
     return (int32) v;
     }
 MACH_CHECK (MCHK_READ);                                 /* nothing answers */
@@ -233,21 +592,22 @@ if (off < LCSPX_FBSIZE) {                               /* frame buffer */
     return;
     }
 if ((off - LCSPX_SP) < LCSPX_SPSIZE) {                  /* scan processor */
-    i = (off - LCSPX_SP) >> 2;
-    sim_debug (DBG_REG, &lcspx_dev, "SP write %04X = %08X (%d), PC %08X\n", off - LCSPX_SP, val, lnt, fault_PC);
-    lcspx_sp[i] = lcspx_merge (lcspx_sp[i], pa, val, lnt);
+    sim_debug (DBG_REG, &lcspx_dev, "SP write %05X = %08X (%d), PC %08X\n", off - LCSPX_SP, val, lnt, fault_PC);
+    sp_wr ((off - LCSPX_SP) & ~3u, pa, val, lnt);
     return;
     }
 if ((off - LCSPX_TBC) < LCSPX_TBCSIZE) {                /* TBC */
     i = (off - LCSPX_TBC) >> 2;
     sim_debug (DBG_REG, &lcspx_dev, "TBC write %03X = %08X (%d), PC %08X\n", off - LCSPX_TBC, val, lnt, fault_PC);
-    lcspx_tbc[i] = lcspx_merge (lcspx_tbc[i], pa, val, lnt);
+    tbc_wr (i, lcspx_merge (lcspx_tbc[i], pa, val, lnt), lcspx_merge (0, pa, val, lnt));
     return;
     }
 if ((off - LCSPX_BT) < LCSPX_BTSIZE) {                  /* Bt459 */
     i = (off - LCSPX_BT) >> 14;
-    sim_debug (DBG_REG, &lcspx_dev, "Bt459 write port %d = %08X (%d), PC %08X\n", i, val, lnt, fault_PC);
-    lcspx_bt[i] = lcspx_merge (lcspx_bt[i], pa, val, lnt);
+    if (lnt < L_LONG)                                   /* the data lane is <7:0> */
+        val = val << ((pa & 3) << 3);
+    sim_debug (DBG_REG, &lcspx_dev, "Bt459 write port %d = %02X, PC %08X\n", i, val & 0xFF, fault_PC);
+    bt_wr (i, val & 0xFF);
     return;
     }
 return;                                                 /* the ROM and the holes ignore writes */
@@ -263,8 +623,11 @@ if (lcspx_fb == NULL) {
         return SCPE_MEM;
     }
 memset (lcspx_sp, 0, sizeof (lcspx_sp));
+memset (sp_lanes, 0, sizeof (sp_lanes));
 memset (lcspx_tbc, 0, sizeof (lcspx_tbc));
-memset (lcspx_bt, 0, sizeof (lcspx_bt));
+tbc_line = 0;
+tbc_tlast = sim_gtime ();
+bt_addr = bt_m3 = 0;
 return SCPE_OK;
 }
 
