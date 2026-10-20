@@ -117,6 +117,7 @@
 /* CSR6 */
 
 #define CSR6_RE         0x80000000                      /* reset */
+#define CSR6_BL1        0x02000000                      /* burst limit 1, its value after reset */
 #define CSR6_IE         0x40000000                      /* interrupt enable */
 #define CSR6_RW         0x5E1C0FCE                      /* IE, BL, BE, SE, ST, SR, OM, DC, FC, PB, AF */
 #define CSR6_MBO        0x01E7F000
@@ -135,9 +136,18 @@
 /* Writable bits of the other CSRs (the console's register test) */
 
 #define CSR_ADDR        0x3FFFFFFC                      /* CSR3, 4, 7 */
-#define CSR9_RW         0x7FC07FC0                      /* watchdog timers */
+#define CSR9_INIT       0x04E204E2                      /* watchdogs RT = TT = 1250 (2 ms) */
 #define CSR13_RW        0x000000FF
-#define CSR10_REV       0x00040000                      /* revision 4 in <19:16> (see sgec_rd) */
+/* NICSR10<20:16>, the chip revision.  The KA680 manual (1990-1991 editions)
+   gives 00030000 as its value after reset, revision 3.  Which revision the
+   KA49's chip has is not known (NICSR10 is a virtual CSR, read through the
+   DN handshake, so a console EXAMINE does not show it).  VMS's EZDRIVER
+   accepts only 3 and 4 (with any other value DECnet bugchecks NETDLLERR as
+   it starts the line) and gives a revision 3 chip extra set-up data; the
+   documented 3 is used. */
+
+#define CSR10_REV       0x00030000
+#define SGEC_SELFTEST   25000                           /* self-test, microseconds */
 
 /* Descriptors */
 
@@ -167,6 +177,7 @@
 #define TDES1_V_DT      28                              /* data type */
 #define TDES1_M_DT      3
 #define  DT_SETUP       2
+#define  DT_DIAG        3
 #define TDES1_AC        0x08000000                      /* no CRC */
 #define TDES1_FS        0x04000000                      /* first segment */
 #define TDES1_LS        0x02000000                      /* last segment */
@@ -209,17 +220,22 @@ uint8 sgec_hash[64];                                    /* hash filter (512 bits
 int32 sgec_hashmode = 0;                                /* hash filtering */
 uint32 sgec_crctab[256];
 uint8 sgec_frame[SGEC_MAXFR + 4];                       /* frame being sent */
+int32 sgec_re = 0;                                     /* CSR6<RE> reads as one (software reset) */
 uint32 sgec_txframes = 0;                               /* statistics */
 uint32 sgec_rxframes = 0;
 
 t_stat sgec_svc (UNIT *uptr);
+t_stat sgec_stsvc (UNIT *uptr);
 t_stat sgec_reset (DEVICE *dptr);
 t_stat sgec_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *cptr);
 const char *sgec_description (DEVICE *dptr);
 static void sgec_update_int (void);
 static void sgec_chip_reset (void);
 
-UNIT sgec_unit = { UDATA (&sgec_svc, 0, 0) };
+UNIT sgec_unit[] = {
+    { UDATA (&sgec_svc, 0, 0) },                        /* DMA engines */
+    { UDATA (&sgec_stsvc, UNIT_DIS, 0) }                /* self-test */
+    };
 
 REG sgec_reg[] = {
     { BRDATAD (CSR,   sgec_csr,   16, 32, SGEC_NCSR, "CSRs as stored") },
@@ -236,8 +252,8 @@ REG sgec_reg[] = {
     };
 
 DEVICE sgec_dev = {
-    "SGEC", &sgec_unit, sgec_reg, NULL,
-    1, 16, 32, 4, 16, 32,
+    "SGEC", sgec_unit, sgec_reg, NULL,
+    2, 16, 32, 4, 16, 32,
     NULL, NULL, &sgec_reset,
     NULL, NULL, NULL,
     NULL, DEV_DEBUG, 0, sgec_debug, NULL, NULL, &sgec_help, NULL, NULL,
@@ -550,6 +566,17 @@ for (cnt = 0; (sgec_csr[6] & CSR6_ST) && (sgec_txst == ST_RUN); cnt++) {
             sgec_csr[5] |= CSR5_TI;
         continue;
         }
+    if (((d1 >> TDES1_V_DT) & TDES1_M_DT) == DT_DIAG) {
+        /* A diagnostic descriptor loads code into the SGEC's internal
+           processor's RAM, a software patch used with the breakpoint
+           register NICSR14 (KA680 manual 10.3.13.1); VMS gives one to a
+           revision 3 chip.  The internal processor is not modelled: the
+           descriptor completes and nothing is sent. */
+        sgec_wrl (cur, 0);
+        if (d1 & TDES1_IC)
+            sgec_csr[5] |= CSR5_TI;
+        continue;
+        }
     if (d1 & TDES1_FS) {                                /* a new frame */
         len = 0;
         err = FALSE;
@@ -614,6 +641,14 @@ int32 sgec_vector (void)
 return (int32) (sgec_csr[0] & CSR0_VEC);
 }
 
+/* End of the self-test, which always passes */
+
+t_stat sgec_stsvc (UNIT *uptr)
+{
+sgec_csr[5] |= CSR5_ID;
+return SCPE_OK;
+}
+
 t_stat sgec_svc (UNIT *uptr)
 {
 sgec_transmit ();
@@ -648,12 +683,13 @@ switch (rg) {
         break;
 
     case 6:
-        val = (sgec_csr[6] & CSR6_RW) | CSR6_MBO;
+        val = (sgec_csr[6] & CSR6_RW) | CSR6_MBO | (sgec_re? CSR6_RE: 0);
         break;
 
     case 10:                                            /* revision, missed frames */
-        val = CSR10_REV | (sgec_csr[10] & 0xFFFF);      /* VMS's EZDRIVER accepts revision 3 or 4 */
-        break;                                          /* only (and loads extra data into a 3) */
+        val = CSR10_REV | (sgec_csr[10] & 0xFFFF);
+        sgec_csr[10] = 0;                               /* the count clears when read */
+        break;
 
     default:
         val = sgec_csr[rg];
@@ -687,7 +723,7 @@ switch (rg) {
     case 1:                                             /* transmit poll demand */
         if (sgec_csr[6] & CSR6_ST) {
             sgec_txst = ST_RUN;
-            sim_activate_abs (&sgec_unit, SGEC_DELAY);
+            sim_activate_abs (&sgec_unit[0], SGEC_DELAY);
             }
         break;
 
@@ -713,12 +749,14 @@ switch (rg) {
     case 6:
         if (v & CSR6_RE) {                              /* reset */
             sgec_chip_reset ();
+            sgec_re = 1;
             break;
             }
+        sgec_re = 0;
         sgec_csr[6] = v & CSR6_RW;
         if (v & CSR6_ST) {                              /* (re)start transmission */
             sgec_txst = ST_RUN;
-            sim_activate_abs (&sgec_unit, SGEC_DELAY);
+            sim_activate_abs (&sgec_unit[0], SGEC_DELAY);
             }
         else sgec_txst = ST_STOP;
         if (v & CSR6_SR) {                              /* start reception */
@@ -732,9 +770,6 @@ switch (rg) {
         sgec_csr[7] = v & CSR_ADDR;
         break;
 
-    case 9:                                             /* watchdog timers */
-        sgec_csr[9] = v & CSR9_RW;
-        break;
 
     case 10:                                            /* revision, missed frames: read only */
         break;
@@ -750,15 +785,25 @@ switch (rg) {
 sgec_update_int ();
 }
 
-/* Chip reset (CSR6<RE>): the self-test passes at once, CSR6 clears, both
-   engines stop, the filter is empty */
+/* Chip reset (CSR6<RE>, or the hardware reset).  The KA680 manual,
+   10.3.18.1 and table 10-39: the registers clear except NICSR3, 4 and 7
+   (unpredictable; kept here), NICSR5<DN> (1), NICSR6<BL> (1), NICSR6<RE>
+   (1 after a software reset) and NICSR9 (RT = TT = 1250); then the
+   self-test runs for 25 ms and sets NICSR5<ID> (here it always passes).
+   Both engines stop and the filter is empty. */
 
 static void sgec_chip_reset (void)
 {
-sim_cancel (&sgec_unit);
-sgec_csr[5] = CSR5_ID;
-sgec_csr[6] = 0;
+sim_cancel (&sgec_unit[0]);
+sim_cancel (&sgec_unit[1]);
+sgec_csr[0] = 0;
+sgec_csr[5] = 0;
+sgec_csr[6] = CSR6_BL1;
+sgec_csr[9] = CSR9_INIT;
 sgec_csr[10] = 0;
+sgec_csr[11] = sgec_csr[12] = sgec_csr[13] = 0;
+sgec_re = 0;
+sim_activate_after (&sgec_unit[1], SGEC_SELFTEST);
 sgec_txst = sgec_rxst = ST_STOP;
 sgec_rxcur = sgec_csr[3];
 sgec_txcur = sgec_csr[4];
