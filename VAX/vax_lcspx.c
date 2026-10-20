@@ -85,13 +85,25 @@
 #endif
 
 #define LCSPX_ROMWORDS  (LCSPX_ROMSIZE >> 2)            /* 64K 16-bit words */
+/* The configuration and diagnostic register is read in bits <31:16> of
+   every option ROM longword (the service manual names the bits; the
+   self-test's subtest 7 shows <31>'s behaviour):
+        <31>    scan processor test: reads 0 for a while after the scan
+                processor is reset (TBC +00C <4>), then 1
+        <30>    timeout
+        <17>    0: 72 Hz monitor timing, 1: 66 Hz
+   The real 4000/90 reads C000 in every longword of the ROM. */
+
 #define LCSPX_ROMHI     0xC0000000                      /* bits <31:16> of every ROM read */
+#define CFG_SPTEST      0x80000000
+#define SP_RESET_INSTR  1000.0                          /* the scan processor's reset, in instructions */
 
 /* Debugging bitmaps */
 
 #define DBG_ROM         0x0001                          /* option ROM */
 #define DBG_REG         0x0002                          /* register access */
 #define DBG_FB          0x0004                          /* frame-buffer access */
+#define DBG_SP          0x0008                          /* scan processor operations */
 
 static uint16 *lcspx_rom = NULL;                        /* option ROM, one word per longword */
 static uint8 *lcspx_fb = NULL;                          /* frame buffer */
@@ -104,12 +116,31 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
    diagnostic view of it.  In the normal view:
         2100-21FC, 2200-22FC    the register file: register i (0-63) is
                                 at 2200 + 4i for i < 32, else 2100 + 4i
+        2100                    <31:24>: nonzero when the microcode is in
+                                the chip, zero when the console must load
+                                it (its init routine and several subtests
+                                take the one path or the other); the
+                                model says 01, the path NetBSD's driver
+                                assumes (read only; the real board's
+                                value is not known)
         212C                    microcode address <25:16> and the
                                 microword's bits <47:32>; reads give the
                                 address and bits <47:32> of the word
                                 there (subtest 9)
         23F8                    the microword's bits <31:0>: a write
                                 stores the 48-bit word at the address
+        316C                    plane mask control: <17:16> apply the
+                                write mask to the CPU's frame-buffer
+                                writes, <25:24> the read mask to its
+                                reads (subtest 16; what each of the two
+                                bits of a pair selects is not known)
+        3170, 3174              write and read plane masks, one bit per
+                                bit of a frame-buffer longword
+        31A8                    the frame buffer's refresh counter: it
+                                changes by itself (subtest 15 waits for
+                                a change); the model counts every 16
+                                instructions, modulo 1024 (the real
+                                counter's width is not known)
    The microcode RAM holds 1024 48-bit words; the console loads it at
    power-up (the option's init routine) and the scan processor runs it.
    In the diagnostic view (+80000) the option ROM's self-test (subtests 7
@@ -129,6 +160,38 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
 #define SP_UCADDR       0x212C                          /* microcode address, bits <47:32> */
 #define SP_UCDATA       0x23F8                          /* microcode bits <31:0> */
 #define SP_UCSIZE       1024                            /* microcode words */
+#define SP_REFRESH      0x31A8                          /* refresh counter */
+#define SP_ID           0x2100                          /* <31:24> nonzero: microcode in the chip */
+#define SP_ID_INIT      0x01000000
+#define SP_XSTART       0x21D0                          /* edges, <31:16> */
+#define SP_YSTART       0x21D4
+#define SP_XEND         0x21D8
+#define SP_YEND         0x21DC
+#define SP_DSTPIX       0x21E0                          /* <31:30> depth, <23:0> first pixel */
+#define SP_SRCPIX       0x21E4
+#define SP_STRIDE       0x21E8                          /* <31:16> source, <15:0> destination */
+#define SP_COMMAND      0x21EC                          /* <0> right to left, <1> bottom to top */
+#define SP_SRCMASK      0x21F0
+#define SP_DSTMASK      0x21F4
+#define SP_MPC          0x21FC                          /* a write starts the microcode */
+#define SP_FG           0x2260
+#define SP_BG           0x2264
+#define SP_DESTLOOP     0x2270                          /* <3:0> logical function */
+
+#define SP_CLIPMIN      0x21C0                          /* clip rectangle: <31:16> y, <15:0> x */
+#define SP_CLIPMAX      0x21C4                          /* (exclusive) */
+
+#define CMD_XNEG        0x00000001
+#define CMD_YNEG        0x00000002
+#define CMD_CLIP        0x00000020                      /* clip to CLIPMIN..CLIPMAX */
+#define PIX_INDEX       0x00FFFFFF
+#define MPC_FILL        0x2019                          /* fill a rectangle with FG */
+#define MPC_COPY        0x201A                          /* copy a rectangle */
+#define SP_PMCTL        0x316C                          /* plane mask control */
+#define SP_WRMASK       0x3170                          /* write plane mask */
+#define SP_RDMASK       0x3174                          /* read plane mask */
+#define PMCTL_WREN      0x00030000                      /* the write mask applies */
+#define PMCTL_RDEN      0x03000000                      /* the read mask applies */
 #define SP_LANEDIAG     0x2000                          /* lanes view */
 #define SP_BYTEREG      0x2300                          /* register file by byte lane */
 #define SP_INVMEM       0xA000                          /* complemented memory */
@@ -178,7 +241,9 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
         +4      write pointer <13:2>: where the next entry goes
         +8      read pointer <13:2>: the oldest entry
         +C      free space <14:2>: 1000 when empty
-   Writing a one to bit k of +00C resets FIFO k: both pointers 0, empty.
+   Writing a one to bit k of +00C resets FIFO k: both pointers 0, empty;
+   a one in bit 4 resets the scan processor (see the configuration and
+   diagnostic register).
 
    A longword write into FIFO k's command window (offset w from the
    option's 100.0000) appends two entries: an address entry, 1000000 | w,
@@ -215,7 +280,8 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
 
 #define TBC_VMASK       0x7FF                           /* vertical fields: 11 bits */
 
-#define TBC_FIFORST     (0x00C >> 2)                    /* <3:0> reset FIFO 3-0 */
+#define TBC_FIFORST     (0x00C >> 2)                    /* <3:0> reset FIFO 3-0, <4> the scan processor */
+#define RST_SP          0x00000010
 #define TBC_FIFO0       (0x040 >> 2)                    /* FIFO 0's data port */
 #define TBC_FIFOSTEP    (0x020 >> 2)                    /* to the next FIFO's */
 #define FIFO_N          4                               /* FIFOs */
@@ -232,6 +298,7 @@ static uint8 lcspx_fifotag[LCSPX_FIFOSIZE >> 2];        /* 1: an address entry *
 static uint32 fifo_wp[FIFO_N], fifo_rp[FIFO_N], fifo_cnt[FIFO_N];
 static uint32 fifo_dest[FIFO_N];                        /* where the next datum goes */
 static uint32 tbc_line = 0;                             /* line counter */
+static double sp_treset = -1.0e30;                      /* when the scan processor was reset */
 static double tbc_tlast = 0;                            /* sim time of the line's start */
 
 /* Bt459 RAMDAC
@@ -268,6 +335,7 @@ static uint8 bt_cur[16];                                /* 300-30F */
 static uint8 bt_curram[1024];                           /* 400-7FF */
 
 t_stat lcspx_reset (DEVICE *dptr);
+t_stat lcspx_svc (UNIT *uptr);
 static void lcspx_wroff (uint32 off, int32 pa, int32 val, int32 lnt);
 static void tbc_advance (void);
 static uint32 tbc_rd (int32 i);
@@ -284,7 +352,7 @@ const char *lcspx_description (DEVICE *dptr);
    lcspx_reg    LCSPX register list
 */
 
-UNIT lcspx_unit = { UDATA (NULL, UNIT_ATTABLE + UNIT_RO, 0) };
+UNIT lcspx_unit = { UDATA (&lcspx_svc, UNIT_ATTABLE + UNIT_RO, 0) };
 
 REG lcspx_reg[] = {
     { BRDATAD (TBC,   lcspx_tbc, 16, 32, LCSPX_TBCSIZE >> 2, "TBC registers") },
@@ -298,6 +366,7 @@ DEBTAB lcspx_debug[] = {
     { "ROM", DBG_ROM, "option ROM" },
     { "REG", DBG_REG, "register access" },
     { "FB",  DBG_FB,  "frame-buffer access" },
+    { "SP",  DBG_SP,  "scan processor operations" },
     { NULL, 0 }
     };
 
@@ -531,11 +600,13 @@ switch (i) {
         lcspx_tbc[i] &= ~(wv & CVI_W1C);
         break;
 
-    case TBC_FIFORST:                                   /* FIFO resets */
+    case TBC_FIFORST:                                   /* FIFO and scan processor resets */
         for (k = 0; k < FIFO_N; k++) {
             if (wv & (1u << k))
                 fifo_wp[k] = fifo_rp[k] = fifo_cnt[k] = 0;
             }
+        if (wv & RST_SP)
+            sp_treset = sim_gtime ();
         lcspx_tbc[i] = nv;
         break;
 
@@ -660,6 +731,171 @@ switch (port) {
         }
 }
 
+/* The scan processor's drawing operations
+
+   The scan processor runs microcode; the model carries out what the
+   microcode does at the entry points the option ROM and NetBSD's spx
+   driver start (the microprogram counter, 21FC), from the registers they
+   set up first:
+        2019    fill the rectangle with FG
+        201A    copy a rectangle from SRCPIX
+   The rectangle's edges are XSTART..XEND and YSTART..YEND (pixels, in
+   <31:16>); COMMAND<0> and <1> draw right to left and bottom to top, the
+   columns from XEND to XSTART - 1 and the rows from YEND to YSTART - 1.
+   DSTPIX (and SRCPIX) give the pixel at (XSTART, YSTART) as an index
+   into the frame buffer, and the pixel depth in <31:30> (0: 8 bits, 1:
+   16, 2: 32); STRIDE gives the line lengths in pixels.  DESTLOOP<3:0> is
+   the logical function of source (FG, or the copied pixel) and
+   destination, numbered as X11's: 3 copies.  The source is masked by
+   SRCMASK, as far as the self-test shows.  With COMMAND<5> only the
+   pixels inside the clip rectangle are drawn: CLIPMIN (21C0) inclusive
+   to CLIPMAX (21C4) exclusive, y in <31:16> and x in <15:0> (subtest
+   18).  When the operation is done
+   the TBC sets its CVAX interrupt status <1>; the model draws at once
+   and reports done after a time that grows with the area (the software
+   clears the status after it starts the operation, then waits). */
+
+#define CVI_SPDONE      0x00000002                      /* scan processor done */
+
+static uint32 sp_reg (uint32 o)
+{
+return lcspx_sp[o >> 2];
+}
+
+static uint32 sp_logic (uint32 fn, uint32 src, uint32 dst)
+{
+switch (fn & 0xF) {
+    case 0x0:   return 0;                               /* clear */
+    case 0x1:   return src & dst;                       /* and */
+    case 0x2:   return src & ~dst;                      /* and reverse */
+    case 0x3:   return src;                             /* copy */
+    case 0x4:   return ~src & dst;                      /* and inverted */
+    case 0x5:   return dst;                             /* no-op */
+    case 0x6:   return src ^ dst;                       /* xor */
+    case 0x7:   return src | dst;                       /* or */
+    case 0x8:   return ~(src | dst);                    /* nor */
+    case 0x9:   return ~(src ^ dst);                    /* equivalence */
+    case 0xA:   return ~dst;                            /* invert */
+    case 0xB:   return src | ~dst;                      /* or reverse */
+    case 0xC:   return ~src;                            /* copy inverted */
+    case 0xD:   return ~src | dst;                      /* or inverted */
+    case 0xE:   return ~(src & dst);                    /* nand */
+    default:    return 0xFFFFFFFF;                      /* set */
+    }
+}
+
+/* A pixel of the frame buffer, by index, at a depth (0, 1, 2) */
+
+static uint32 fb_getpix (uint32 idx, uint32 depth)
+{
+uint32 b = (idx << depth) & (LCSPX_FBSIZE - 1);
+
+switch (depth) {
+    case 0:     return lcspx_fb[b];
+    case 1:     return lcspx_fb[b & ~1u] | (lcspx_fb[(b & ~1u) + 1] << 8);
+    default:    b = b & ~3u;
+                return lcspx_fb[b] | (lcspx_fb[b + 1] << 8) |
+                    (lcspx_fb[b + 2] << 16) | ((uint32) lcspx_fb[b + 3] << 24);
+    }
+}
+
+static void fb_putpix (uint32 idx, uint32 depth, uint32 v)
+{
+uint32 b = (idx << depth) & (LCSPX_FBSIZE - 1);
+
+switch (depth) {
+    case 0:     lcspx_fb[b] = v & 0xFF;
+                break;
+    case 1:     b = b & ~1u;
+                lcspx_fb[b] = v & 0xFF;
+                lcspx_fb[b + 1] = (v >> 8) & 0xFF;
+                break;
+    default:    b = b & ~3u;
+                lcspx_fb[b] = v & 0xFF;
+                lcspx_fb[b + 1] = (v >> 8) & 0xFF;
+                lcspx_fb[b + 2] = (v >> 16) & 0xFF;
+                lcspx_fb[b + 3] = (v >> 24) & 0xFF;
+                break;
+    }
+}
+
+static int32 sp_rect (t_bool copy)
+{
+uint32 cmd = sp_reg (SP_COMMAND);
+int32 xs = (int32) (sp_reg (SP_XSTART) >> 16), xe = (int32) (sp_reg (SP_XEND) >> 16);
+int32 ys = (int32) (sp_reg (SP_YSTART) >> 16), ye = (int32) (sp_reg (SP_YEND) >> 16);
+uint32 depth = sp_reg (SP_DSTPIX) >> 30;
+uint32 pmask = (depth == 0)? 0xFF: ((depth == 1)? 0xFFFF: 0xFFFFFFFF);
+int32 dstride = (int32) (sp_reg (SP_STRIDE) & 0xFFFF);
+int32 sstride = (int32) (sp_reg (SP_STRIDE) >> 16);
+int32 dx = (cmd & CMD_XNEG)? -1: 1, dy = (cmd & CMD_YNEG)? -1: 1;
+int32 w = (xe - xs) * dx, h = (ye - ys) * dy;           /* sizes, when the direction agrees */
+int32 x0 = (dx < 0)? -1: 0, y0 = (dy < 0)? -1: 0;       /* first column and row from the start */
+uint32 fn = sp_reg (SP_DESTLOOP) & 0xF;
+uint32 smask = sp_reg (SP_SRCMASK) & pmask;
+uint32 dbase = sp_reg (SP_DSTPIX) & PIX_INDEX, sbase = sp_reg (SP_SRCPIX) & PIX_INDEX;
+uint32 fg = sp_reg (SP_FG) & pmask;
+t_bool clip = (cmd & CMD_CLIP)? TRUE: FALSE;
+int32 cx0 = sp_reg (SP_CLIPMIN) & 0xFFFF, cy0 = sp_reg (SP_CLIPMIN) >> 16;
+int32 cx1 = sp_reg (SP_CLIPMAX) & 0xFFFF, cy1 = sp_reg (SP_CLIPMAX) >> 16;
+int32 r, c, x, y;
+uint32 d, src;
+
+sim_debug (DBG_SP, &lcspx_dev, "%s x %d..%d y %d..%d cmd %08X fn %X dst %06X src %06X stride %d/%d fg %X mask %X\n",
+    copy? "copy": "fill", xs, xe, ys, ye, cmd, fn, dbase, sbase, dstride, sstride, fg, smask);
+if ((w <= 0) || (h <= 0))
+    return 0;
+for (r = 0; r < h; r++) {
+    y = y0 + r * dy;
+    for (c = 0; c < w; c++) {
+        x = x0 + c * dx;
+        if (clip && (((xs + x) < cx0) || ((xs + x) >= cx1) ||
+            ((ys + y) < cy0) || ((ys + y) >= cy1)))
+            continue;
+        src = copy? fb_getpix (sbase + x + y * sstride, depth): fg;
+        src = src & smask;
+        d = fb_getpix (dbase + x + y * dstride, depth);
+        fb_putpix (dbase + x + y * dstride, depth, sp_logic (fn, src, d) & pmask);
+        }
+    }
+return w * h;
+}
+
+/* The microprogram counter was written: run the operation */
+
+#define SP_DONE_MIN     50                              /* instructions to "done", at least */
+#define SP_PIX_PER_INSTR 8                              /* and per pixel drawn */
+
+static void sp_start (uint32 mpc)
+{
+int32 n = 0;
+
+switch (mpc & 0xFFFF) {
+
+    case MPC_FILL:
+        n = sp_rect (FALSE);
+        break;
+
+    case MPC_COPY:
+        n = sp_rect (TRUE);
+        break;
+
+    default:
+        sim_debug (DBG_SP, &lcspx_dev, "microcode entry %04X not modelled\n", mpc);
+        break;
+        }
+sim_cancel (&lcspx_unit);
+sim_activate (&lcspx_unit, SP_DONE_MIN + n / SP_PIX_PER_INSTR);
+}
+
+/* The scan processor has finished */
+
+t_stat lcspx_svc (UNIT *uptr)
+{
+lcspx_tbc[TBC_CVINTSTS] |= CVI_SPDONE;
+return SCPE_OK;
+}
+
 /* Scan processor space: o is the longword's offset in the space */
 
 static uint32 sp_rd (uint32 o)
@@ -678,6 +914,8 @@ else if (n == SP_UCADDR)
     return (sp_ucaddr << 16) | sp_ucmhi[sp_ucaddr];
 else if (n == SP_UCDATA)
     return sp_uclo[sp_ucaddr];
+else if (n == SP_REFRESH)
+    return ((uint32) (sim_gtime () / 16.0)) & 0x3FF;
 return lcspx_sp[n >> 2];
 }
 
@@ -710,7 +948,11 @@ else if (n == SP_UCDATA) {
     sp_ucmhi[sp_ucaddr] = (uint16) sp_uchi;
     return;
     }
+if (n == SP_ID)                                         /* read only */
+    return;
 lcspx_sp[n >> 2] = lcspx_merge (lcspx_sp[n >> 2], pa, val, lnt);
+if (n == SP_MPC)
+    sp_start (lcspx_sp[n >> 2]);
 }
 
 /* Read the option's window
@@ -732,6 +974,8 @@ if (off < LCSPX_FBSIZE) {                               /* frame buffer */
     off = off & ~3u;
     v = lcspx_fb[off] | (lcspx_fb[off + 1] << 8) |
         (lcspx_fb[off + 2] << 16) | ((uint32) lcspx_fb[off + 3] << 24);
+    if (lcspx_sp[SP_PMCTL >> 2] & PMCTL_RDEN)           /* read plane mask */
+        v = v & lcspx_sp[SP_RDMASK >> 2];
     sim_debug (DBG_FB, &lcspx_dev, "FB read %06X = %08X\n", off, v);
     return (int32) v;
     }
@@ -739,6 +983,8 @@ if ((off - LCSPX_ROM) < LCSPX_ROMSIZE) {                /* option ROM */
     if (lcspx_rom == NULL)                              /* no file: reads zero */
         return 0;
     v = LCSPX_ROMHI | lcspx_rom[(off - LCSPX_ROM) >> 2];
+    if ((sim_gtime () - sp_treset) < SP_RESET_INSTR)  /* the scan processor is still resetting */
+        v = v & ~CFG_SPTEST;
     sim_debug (DBG_ROM, &lcspx_dev, "ROM read %05X = %08X\n", off - LCSPX_ROM, v);
     return (int32) v;
     }
@@ -791,20 +1037,21 @@ static void lcspx_wroff (uint32 off, int32 pa, int32 val, int32 lnt)
 uint32 i;
 
 if (off < LCSPX_FBSIZE) {                               /* frame buffer */
+    uint32 old, nv, m;
+
     sim_debug (DBG_FB, &lcspx_dev, "FB write %06X = %08X (%d)\n", off, val, lnt);
-    if (lnt >= L_LONG) {
-        off = off & ~3u;
-        lcspx_fb[off] = val & 0xFF;
-        lcspx_fb[off + 1] = (val >> 8) & 0xFF;
-        lcspx_fb[off + 2] = (val >> 16) & 0xFF;
-        lcspx_fb[off + 3] = (val >> 24) & 0xFF;
+    off = off & ~3u;
+    old = lcspx_fb[off] | (lcspx_fb[off + 1] << 8) |
+        (lcspx_fb[off + 2] << 16) | ((uint32) lcspx_fb[off + 3] << 24);
+    nv = lcspx_merge (old, pa, val, lnt);
+    if (lcspx_sp[SP_PMCTL >> 2] & PMCTL_WREN) {         /* write plane mask */
+        m = lcspx_sp[SP_WRMASK >> 2];
+        nv = (old & ~m) | (nv & m);
         }
-    else if (lnt == L_WORD) {
-        off = off & ~1u;
-        lcspx_fb[off] = val & 0xFF;
-        lcspx_fb[off + 1] = (val >> 8) & 0xFF;
-        }
-    else lcspx_fb[off] = val & 0xFF;
+    lcspx_fb[off] = nv & 0xFF;
+    lcspx_fb[off + 1] = (nv >> 8) & 0xFF;
+    lcspx_fb[off + 2] = (nv >> 16) & 0xFF;
+    lcspx_fb[off + 3] = (nv >> 24) & 0xFF;
     return;
     }
 if (((off - LCSPX_CMD) < (FIFO_N * LCSPX_CMDSTEP)) &&   /* a FIFO's command window */
@@ -858,6 +1105,8 @@ if (lcspx_fb == NULL) {
     }
 memset (lcspx_sp, 0, sizeof (lcspx_sp));
 memset (sp_lanes, 0, sizeof (sp_lanes));
+lcspx_sp[SP_ID >> 2] = SP_ID_INIT;
+sim_cancel (&lcspx_unit);
 sp_ucaddr = sp_uchi = 0;
 memset (lcspx_tbc, 0, sizeof (lcspx_tbc));
 tbc_line = 0;
