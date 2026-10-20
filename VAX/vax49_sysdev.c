@@ -188,7 +188,12 @@ int32 sys_model = 0;                                    /* no graphics console *
    <8>      tag diagnostic mode: tag store writes store the check bits as
             written instead of computing them (guess: the console uses it
             only together with a test that needs exactly that)
-   <30>     SW_ETM, <31> HW_ETM: error transition modes (NetBSD)
+   <30>     SW_ETM, <31> HW_ETM: error transition modes (NetBSD).  HW_ETM
+            is status, set by the Cbox on an error and cleared by writing
+            one: VMS writes 80000011 at start-up, and the real 4000/90's
+            error log then shows CCTL 00000011, where a stored bit 31 made
+            the model's say "HARDWARE ERROR TRANSITION MODE" (2026-10-20).
+            The model never sets it.
 
    The model has no Bcache in normal operation: memory is always coherent.
    It keeps just enough state for the console's Bcache tests: the tag
@@ -199,6 +204,7 @@ int32 sys_model = 0;                                    /* no graphics console *
 #define CCTL_FORCEHIT   0x00000040
 #define CCTL_SWECC      0x00000080
 #define CCTL_TAGDIAG    0x00000100
+#define CCTL_HWETM      0x80000000                      /* hardware error transition mode: status, W1C */
 #define BCDATA_SIZE     (256 * 1024)                    /* Bcache data RAM */
 #define CACHEABLE_END   0x20000000                      /* PA<29> = 0: memory space */
 
@@ -933,8 +939,8 @@ switch (rg) {
     case MT_MTBTAG: case MT_MTBPTE:                     /* TB fill: the TB is SIMH's */
         break;
 
-    case MT_CCTL:
-        ka_cctl = val;
+    case MT_CCTL:                                       /* <31> HW_ETM: write one to clear */
+        ka_cctl = (val & ~CCTL_HWETM) | (ka_cctl & CCTL_HWETM & ~val);
         ka49_set_cdiag ();
         break;
 
