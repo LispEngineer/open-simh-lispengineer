@@ -165,7 +165,14 @@
    it starts the line) and gives a revision 3 chip extra set-up data; the
    documented 3 is used. */
 #define CSR10_REV       0x00030000
-#define SGEC_SELFTEST   25000                           /* self-test, microseconds */
+/* The self-test takes 25 ms on the chip (KA680 10.3.18.1).  The model ends
+   it after a few instructions: the KA49 console waits for NICSR5<ID> with
+   its own delay loops and accepts ID at once, and VMS and NetBSD poll for
+   it.  25 ms is the device's only delay that SIMH converts from wall-clock
+   time with its calibration, and it is the likely cause of the one
+   failure seen: on a busy host the console's NI interrupt test once
+   failed its initialisation (error 4C). */
+#define SGEC_SELFTEST   20                              /* self-test, instructions */
 #define SGEC_VLATCH     5000                            /* virtual CSR read latch, instructions */
 
 /* Descriptors */
@@ -1251,7 +1258,7 @@ sgec_csr[11] = sgec_csr[12] = sgec_csr[13] = sgec_csr[14] = 0;
 sgec_csr[15] = CSR15_INIT;
 sgec_re = 0;
 sgec_vrg = -1;
-sim_activate_after (&sgec_unit[1], SGEC_SELFTEST);
+sim_activate (&sgec_unit[1], SGEC_SELFTEST);
 sgec_txst = sgec_rxst = ST_STOP;
 sgec_csr3w = sgec_csr4w = 0;
 sgec_rxcur = sgec_csr[3];
