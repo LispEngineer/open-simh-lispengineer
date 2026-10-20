@@ -444,6 +444,14 @@ extern int32 sys_model;
 #define SGEC_SET_INT    SET_INT (NI)
 #define SGEC_CLR_INT    CLR_INT (NI)
 
+/* The station address is the network address ROM's (vax_nar.c) */
+
+extern uint8 nar_mac[6];
+extern DEVICE nar_dev;
+t_stat nar_reset (DEVICE *dptr);
+#define SGEC_GET_MAC(m) memcpy ((m), nar_mac, 6)
+#define SGEC_SET_MAC(m) (memcpy (nar_mac, (m), 6), nar_reset (&nar_dev))
+
 /* Machine specific definitions - RZ94: the board's DMA engine (the SQWF)
    moves the data, through the SCSI scatter/gather map, from the window
    address in its own DMA address register; the 53C94's request reaches
