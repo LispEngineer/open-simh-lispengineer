@@ -302,6 +302,11 @@ extern int32 ka_cdiag;
 #define NARBASE         0x27800000                      /* NAR base */
 #define NARSPAN         (NARSIZE << 2)                  /* one byte per longword */
 
+/* LCSPX graphics option (vax_lcspx.c): a 32 MB window, option ROM at
+   39BC.0000 */
+
+#define LCSPX_BASE      0x38000000
+
 /* Other address spaces */
 
 #define ADDR_IS_IO(x)   (0)

@@ -46,6 +46,7 @@
 
 #include "vax_defs.h"
 #include "vax_sgec.h"
+#include "vax_lcspx.h"
 
 #ifdef DONT_USE_INTERNAL_ROM
 #define BOOT_CODE_FILENAME "ka49a.bin"
@@ -117,7 +118,7 @@ int32 sys_model = 0;                                    /* no graphics console *
    reports HW_MODEL 378, "Unknown VAXstation 4000-90", and the licence
    manager calls the CPU configuration unsupported; with it set, HW_MODEL
    376 and "VAXstation 4000-90", as on the real machines (found by
-   experiment; the LCSPX itself is a placeholder, see lcspx_rom_rd).  The
+   experiment).  SET LCSPX DISABLED clears <1> (vax_lcspx.c).  The
    console sizes memory from <9:6> alone and programs MEMCON0/1 from them,
    so they must agree with SET CPU memory size. */
 
@@ -524,7 +525,10 @@ switch (lvl) {
 
 static int32 cfg_for_memory (void)
 {
-int32 v = CFG_LCSPX | CFG_TESTS | CFG_SERCON;           /* LCSPX, serial console, run the tests */
+int32 v = CFG_TESTS | CFG_SERCON;                       /* serial console, run the tests */
+
+if (lcspx_present ())                                   /* the graphics option */
+    v = v | CFG_LCSPX;
 
 switch ((uint32) (MEMSIZE >> 20)) {                     /* MB */
 
@@ -1528,25 +1532,6 @@ void aud_wr (int32 pa, int32 val, int32 lnt)
 return;
 }
 
-/* LCSPX placeholder.  The graphics are not modelled.  With configuration
-   bit 1 set the console reads the LCSPX's option ROM at 39BC.0000 (a DEC
-   option ROM: a header, the device name and the option's own test
-   script); a read that machine-checks there is fatal to the console.  The
-   model's option ROM reads as zero, which the console rejects as an
-   invalid ROM width (its routine 200432C8): the graphics test reports
-   "?? 016 2 UNK 0014" (SHOW ERROR "000E") and the console goes on.  A real
-   4000/90 with no monitor reports "?? 001 2 LCSPX 0512", from the LCSPX
-   ROM's own test, which this project does not have.  The size of the
-   window is a guess. */
-
-#define LCSPX_ROMBASE   0x39BC0000
-#define LCSPX_ROMSIZE   0x00040000
-
-int32 lcspx_rom_rd (int32 pa)
-{
-return 0;
-}
-
 /* Read/write I/O register space
 
    These routines are the 'catch all' for address space map.  Any
@@ -1576,7 +1561,7 @@ struct reglink regtable[] = {
     { KABASE, KABASE+KASIZE, &ka_rd, &ka_wr },
     { SGMBASE, SGMBASE+SGMSIZE, &sgm_rd, &sgm_wr },
     { NARBASE, NARBASE+NARSPAN, &ka_nar_rd, NULL },
-    { LCSPX_ROMBASE, LCSPX_ROMBASE+LCSPX_ROMSIZE, &lcspx_rom_rd, NULL },
+    { LCSPX_BASE, LCSPX_BASE+LCSPX_WINSIZE, &lcspx_rd, &lcspx_wr },
     { 0, 0, NULL, NULL }
     };
 
