@@ -184,6 +184,9 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
 #define CMD_XNEG        0x00000001
 #define CMD_YNEG        0x00000002
 #define CMD_CLIP        0x00000020                      /* clip to CLIPMIN..CLIPMAX */
+#define CMD_WRMASK      0x00020000                      /* SRCMASK masks the writes */
+#define CMD_RDMASK      0x00040000                      /* SRCMASK masks the destination read */
+#define CMD_SRCMASK     0x01000000                      /* DSTMASK masks the source read */
 #define PIX_INDEX       0x00FFFFFF
 #define MPC_FILL        0x2019                          /* fill a rectangle with FG */
 #define MPC_COPY        0x201A                          /* copy a rectangle */
@@ -746,8 +749,13 @@ switch (port) {
    into the frame buffer, and the pixel depth in <31:30> (0: 8 bits, 1:
    16, 2: 32); STRIDE gives the line lengths in pixels.  DESTLOOP<3:0> is
    the logical function of source (FG, or the copied pixel) and
-   destination, numbered as X11's: 3 copies.  The source is masked by
-   SRCMASK, as far as the self-test shows.  With COMMAND<5> only the
+   destination, numbered as X11's: 3 copies.  SRCMASK (21F0) is a mask
+   over each longword of the frame buffer (four 8-bit pixels): with
+   COMMAND<17> it masks what is written, with COMMAND<18> it masks the
+   destination before the logical function (subtest 20); with
+   COMMAND<24> DSTMASK (21F4) masks the copied source pixels (subtest 23).
+   (The names are NetBSD's.)  With COMMAND<5>
+   only the
    pixels inside the clip rectangle are drawn: CLIPMIN (21C0) inclusive
    to CLIPMAX (21C4) exclusive, y in <31:16> and x in <15:0> (subtest
    18).  When the operation is done
@@ -832,17 +840,18 @@ int32 dx = (cmd & CMD_XNEG)? -1: 1, dy = (cmd & CMD_YNEG)? -1: 1;
 int32 w = (xe - xs) * dx, h = (ye - ys) * dy;           /* sizes, when the direction agrees */
 int32 x0 = (dx < 0)? -1: 0, y0 = (dy < 0)? -1: 0;       /* first column and row from the start */
 uint32 fn = sp_reg (SP_DESTLOOP) & 0xF;
-uint32 smask = sp_reg (SP_SRCMASK) & pmask;
+uint32 lmask = sp_reg (SP_SRCMASK);                     /* over a frame-buffer longword */
+uint32 smask = sp_reg (SP_DSTMASK);                     /* the same, for the source */
 uint32 dbase = sp_reg (SP_DSTPIX) & PIX_INDEX, sbase = sp_reg (SP_SRCPIX) & PIX_INDEX;
 uint32 fg = sp_reg (SP_FG) & pmask;
 t_bool clip = (cmd & CMD_CLIP)? TRUE: FALSE;
 int32 cx0 = sp_reg (SP_CLIPMIN) & 0xFFFF, cy0 = sp_reg (SP_CLIPMIN) >> 16;
 int32 cx1 = sp_reg (SP_CLIPMAX) & 0xFFFF, cy1 = sp_reg (SP_CLIPMAX) >> 16;
 int32 r, c, x, y;
-uint32 d, src;
+uint32 d, src, res, m, idx;
 
 sim_debug (DBG_SP, &lcspx_dev, "%s x %d..%d y %d..%d cmd %08X fn %X dst %06X src %06X stride %d/%d fg %X mask %X\n",
-    copy? "copy": "fill", xs, xe, ys, ye, cmd, fn, dbase, sbase, dstride, sstride, fg, smask);
+    copy? "copy": "fill", xs, xe, ys, ye, cmd, fn, dbase, sbase, dstride, sstride, fg, lmask);
 if ((w <= 0) || (h <= 0))
     return 0;
 for (r = 0; r < h; r++) {
@@ -852,10 +861,20 @@ for (r = 0; r < h; r++) {
         if (clip && (((xs + x) < cx0) || ((xs + x) >= cx1) ||
             ((ys + y) < cy0) || ((ys + y) >= cy1)))
             continue;
-        src = copy? fb_getpix (sbase + x + y * sstride, depth): fg;
-        src = src & smask;
-        d = fb_getpix (dbase + x + y * dstride, depth);
-        fb_putpix (dbase + x + y * dstride, depth, sp_logic (fn, src, d) & pmask);
+        if (copy) {
+            idx = sbase + x + y * sstride;
+            src = fb_getpix (idx, depth);
+            if (cmd & CMD_SRCMASK)
+                src = src & (smask >> (((idx << depth) & 3) << 3));
+            }
+        else src = fg;
+        idx = dbase + x + y * dstride;
+        m = (lmask >> (((idx << depth) & 3) << 3)) & pmask; /* this pixel's part of the mask */
+        d = fb_getpix (idx, depth);
+        res = sp_logic (fn, src, (cmd & CMD_RDMASK)? (d & m): d) & pmask;
+        if (cmd & CMD_WRMASK)
+            res = (d & ~m) | (res & m);
+        fb_putpix (idx, depth, res);
         }
     }
 return w * h;
