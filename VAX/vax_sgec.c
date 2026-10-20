@@ -321,8 +321,15 @@ void sgec_read_callback (int status);
 #define UNIT_V_NOHB     (UNIT_V_UF + 0)                 /* no heartbeat from the transceiver */
 #define UNIT_NOHB       (1u << UNIT_V_NOHB)
 
+/* No heartbeat by default: the real 4000/90's transceiver sends no SQE
+   test, so its SGEC reports heartbeat failure on every frame (VMS's LANCP
+   "Collision detect check failure" equals the frames sent, and the
+   console's own SHOW MOP counts HrtBtErr), 2026-10-19 and 2026-10-20.
+   The report is harmless; SET SGEC HEARTBEAT gives a transceiver with
+   one. */
+
 UNIT sgec_unit[] = {
-    { UDATA (&sgec_svc, UNIT_IDLE | UNIT_ATTABLE, 0) }, /* DMA engines, network */
+    { UDATA (&sgec_svc, UNIT_IDLE | UNIT_ATTABLE | UNIT_NOHB, 0) }, /* DMA engines, network */
     { UDATA (&sgec_stsvc, UNIT_DIS, 0) }                /* self-test */
     };
 
@@ -1450,10 +1457,10 @@ fprintf (st, "The station address is the one in the network address ROM, which t
 fprintf (st, "console and the operating system read and give to the chip in a setup\n");
 fprintf (st, "frame; SET SGEC MAC=xx-xx-xx-xx-xx-xx changes it (before ATTACH).  Two\n");
 fprintf (st, "simulators on the same network need different addresses.\n\n");
-fprintf (st, "The transmit status reports a working transceiver; SET SGEC NOHEARTBEAT\n");
-fprintf (st, "reports heartbeat failure on every frame sent, as a transceiver that\n");
-fprintf (st, "sends no SQE test does (VMS counts it as \"collision detect check\n");
-fprintf (st, "failure\"; it is harmless).\n\n");
+fprintf (st, "The transmit status reports heartbeat failure on every frame sent, as\n");
+fprintf (st, "the transceiver of the real VAXstation 4000/90 it was compared with does\n");
+fprintf (st, "(it sends no SQE test; VMS counts \"collision detect check failure\", which\n");
+fprintf (st, "is harmless).  SET SGEC HEARTBEAT reports a transceiver that sends one.\n\n");
 fprint_set_help (st, dptr);
 fprint_show_help (st, dptr);
 fprint_reg_help (st, dptr);
