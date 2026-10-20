@@ -156,7 +156,11 @@
 #define CSR_ADDR        0x3FFFFFFC                      /* CSR3, 4, 7 */
 #define CSR9_INIT       0x04E204E2                      /* watchdogs RT = TT = 1250 (2 ms) */
 #define CSR13_RW        0x000000FF
-#define CSR15_INIT      0x00000FFF
+/* NICSR15 (monitor) reads 0000FFFF on a real KA49 at the console after a
+   VMS shutdown (2026-10-20); neither the console's power-up tests nor
+   VMS write it, so that is taken as its reset value (the KA680 manual,
+   10.3.13, gives 00000FFF). */
+#define CSR15_INIT      0x0000FFFF
 /* NICSR10<20:16>, the chip revision.  The KA680 manual (1990-1991 editions)
    gives 00030000 as its value after reset, revision 3.  Which revision the
    KA49's chip has is not known (NICSR10 is a virtual CSR, read through the
