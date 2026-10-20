@@ -53,6 +53,9 @@
         130.0000 - 13F.FFFF     scan processor (13 8000 up: its
                                 diagnostic view)
         140.0000 - 16F.FFFF     FIFO 1's command window
+        170.0000 - 17F.FFFF     the scan processor again (the
+                                self-test's streaming subtests 28 and
+                                29 set it up here)
         180.0000 - 1AF.FFFF     FIFO 2's command window
         1C0.0000 - 1EF.FFFF     FIFO 3's command window
         1B0.0000 - 1B0.03FF     TBC
@@ -195,6 +198,8 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
 #define MPC_FILL        0x2019                          /* fill a rectangle with FG */
 #define MPC_COPY        0x201A                          /* copy a rectangle */
 #define MPC_VECTOR      0x2099                          /* draw a vector */
+#define MPC_STREAMIN    0x201F                          /* write the rectangle from a FIFO */
+#define MPC_STREAMOUT   0x201E                          /* read the rectangle into a FIFO */
 #define CMD_NOFIRST     0x00000800                      /* vector: leave out the first point */
 #define CMD_NOLAST      0x00000400                      /* vector: leave out the last point */
 #define SP_PMCTL        0x316C                          /* plane mask control */
@@ -258,10 +263,13 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
    A longword write into FIFO k's command window (offset w from the
    option's 100.0000) appends two entries: an address entry, 1000000 | w,
    and the data.  The FIFO keeps a tag with each entry (the data may have
-   bit 24 set too).  While the FIFO's routing is enabled in the TBC's
-   +004 (bit 3 + 5k; FIFO 3: bit 19; subtest 12) the TBC takes the
-   entries and writes each datum to the register its address entry names,
-   advancing the address by four for further data.  Within the FIFO's
+   bit 24 set too).  While TBC +004<23:21> names the FIFO (4 + k;
+   subtests 12, 13 and 28) the TBC takes its entries and writes each
+   datum to the register its address entry names, advancing the address
+   by four for further data; data with no address entry before them go
+   to the scan processor as pixels (streaming), and wait in the FIFO
+   until it takes them.  The other bits of +004
+   are set per FIFO by the self-test; their meaning is not known.  Within the FIFO's
    window:
         20.0000 - 23.FFFF       the TBC's space: its registers, the
                                 Bt459, the FIFO memory (1B0.0000 up;
@@ -299,6 +307,7 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
 #define FIFO_BLOCK      (0x8000 >> 2)                   /* FIFO memory per FIFO, longwords */
 #define TBC_ROUTE       (0x004 >> 2)                    /* FIFO routing */
 #define FIFO_ADDR       0x01000000                      /* an address entry */
+#define FIFO_NODEST     0xFFFFFFFF                      /* no address entry yet */
 #define CMD_TBC         0x00200000                      /* command address: TBC space */
 #define CMD_TBCSIZE     0x00040000
 #define TBC_LINE_USEC   13.0                            /* one line, 1280 x 1024 at 72 Hz */
@@ -308,6 +317,7 @@ static uint8 lcspx_fifotag[LCSPX_FIFOSIZE >> 2];        /* 1: an address entry *
 static uint32 fifo_wp[FIFO_N], fifo_rp[FIFO_N], fifo_cnt[FIFO_N];
 static uint32 fifo_dest[FIFO_N];                        /* where the next datum goes */
 static uint32 tbc_line = 0;                             /* line counter */
+static uint32 tbc_frames = 0;                           /* frames displayed (VBS reached) */
 static double sp_treset = -1.0e30;                      /* when the scan processor was reset */
 static double tbc_tlast = 0;                            /* sim time of the line's start */
 
@@ -333,6 +343,9 @@ static double tbc_tlast = 0;                            /* sim time of the line'
                                         20C-20E signature (red, green, blue) */
 
 #define BT_ID           0x4A                            /* Bt459 identification */
+#define BT_SAR          0x20C                           /* signature registers 20C-20E */
+#define BT_TEST         0x20B                           /* test register: <2:0> pixel phase */
+#define BT_PRM          0x204                           /* pixel read mask */
 #define BT_AMASK        0xFFF                           /* address register */
 
 static uint32 bt_addr = 0;                              /* address register */
@@ -343,6 +356,8 @@ static uint8 bt_curcol[3][3];                           /* cursor colours */
 static uint8 bt_reg[16];                                /* 200-20F */
 static uint8 bt_cur[16];                                /* 300-30F */
 static uint8 bt_curram[1024];                           /* 400-7FF */
+static uint32 bt_sar = 0;                               /* signature: red <7:0>, green, blue */
+static uint32 bt_sar_frames = 0;                        /* frames already in it */
 
 t_stat lcspx_reset (DEVICE *dptr);
 t_stat lcspx_svc (UNIT *uptr);
@@ -350,6 +365,12 @@ static void lcspx_wroff (uint32 off, int32 pa, int32 val, int32 lnt);
 static void tbc_advance (void);
 static uint32 tbc_rd (int32 i);
 static void tbc_wr (int32 i, uint32 nv, uint32 wv);
+static t_bool sp_stream_in (uint32 v);
+
+#define SP_DONE_MIN     50                              /* instructions to "done", at least */
+
+static int32 sp_in_left = 0;                            /* streaming in: pixels still to come */
+static uint32 sp_in_x, sp_in_y, sp_in_w;                /* the next pixel, the width */
 t_stat lcspx_attach (UNIT *uptr, CONST char *cptr);
 t_stat lcspx_detach (UNIT *uptr);
 t_stat lcspx_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *cptr);
@@ -464,6 +485,7 @@ if (vbf == 0)                                           /* a frame is at least o
 if ((now - tbc_tlast) >= (ipl * (vbf + 1))) {           /* a whole frame or more: every event */
     n = (uint32) ((now - tbc_tlast) / ipl);
     lcspx_tbc[TBC_CVINTSTS] |= CVI_VBS | CVI_VBF;
+    tbc_frames = tbc_frames + ((n / (vbf + 1)) ? (n / (vbf + 1)): 1);
     tbc_vbf_reqs ();
     tbc_line = (tbc_line + n) % (vbf + 1);
     tbc_tlast = tbc_tlast + n * ipl;
@@ -477,8 +499,10 @@ while (now - tbc_tlast >= ipl) {
         tbc_vbf_reqs ();
         }
     else tbc_line++;
-    if (tbc_line == vbs)
+    if (tbc_line == vbs) {
         lcspx_tbc[TBC_CVINTSTS] |= CVI_VBS;
+        tbc_frames++;
+        }
     }
 }
 
@@ -513,7 +537,7 @@ return v;
 
 static t_bool fifo_routed (int32 k)
 {
-return (lcspx_tbc[TBC_ROUTE] & (1u << ((k < 3)? (3 + 5 * k): 19)))? TRUE: FALSE;
+return (((lcspx_tbc[TBC_ROUTE] >> 21) & 7) == (uint32) (4 | k))? TRUE: FALSE;
 }
 
 /* Carry out one datum taken from a FIFO */
@@ -540,9 +564,16 @@ if (busy)
 busy = TRUE;
 for (k = 0; k < FIFO_N; k++) {
     while (fifo_routed (k) && (fifo_cnt[k] > 0)) {
+        if (!lcspx_fifotag[k * FIFO_BLOCK + fifo_rp[k]] &&   /* pixel data, but no stream: wait */
+            (fifo_dest[k] == FIFO_NODEST) && (sp_in_left <= 0))
+            break;
         v = fifo_get (k, &addr);
         if (addr)
             fifo_dest[k] = v & 0x00FFFFFC;
+        else if (fifo_dest[k] == FIFO_NODEST) {         /* pixel data for the scan processor */
+            if (sp_stream_in (v) && (sp_in_left <= 0))
+                sim_activate_abs (&lcspx_unit, SP_DONE_MIN);
+            }
         else {
             cmd_write (fifo_dest[k], v);
             fifo_dest[k] = (fifo_dest[k] + 4) & 0x00FFFFFC;
@@ -612,8 +643,10 @@ switch (i) {
 
     case TBC_FIFORST:                                   /* FIFO and scan processor resets */
         for (k = 0; k < FIFO_N; k++) {
-            if (wv & (1u << k))
+            if (wv & (1u << k)) {
                 fifo_wp[k] = fifo_rp[k] = fifo_cnt[k] = 0;
+                fifo_dest[k] = FIFO_NODEST;
+                }
             }
         if (wv & RST_SP)
             sp_treset = sim_gtime ();
@@ -637,6 +670,67 @@ switch (i) {
         lcspx_tbc[i] = nv;
         break;
         }
+}
+
+/* Bt459 signature analysis
+
+   The three 8-bit signature registers (20C red, 20D green, 20E blue)
+   form one 24-bit linear feedback shift register, red first.  During
+   active display it takes one pixel per load group (the Bt459 here
+   multiplexes four pixels; test register <2:0> picks which of the four):
+   every bit n takes the colour bit n XOR the bit below it, bit 0 the
+   feedback, the XOR of bits 2, 4, 6 of each register and bits 0 and 7 of
+   blue ... as Brooktree's data sheet draws it (Bt459, figure 16, "Signature
+   Analysis Register Circuit": red 2 4 6, green 0 2 4 6, blue 0 2 4 6 7),
+   with the colour from the colour map complemented.  That reproduces
+   all eight signatures that the option ROM's subtest 30 expects (four
+   pixel phases in each of two display formats), so it is what the chip
+   does.  The active display is (TBC +10C<8:0> + 1) four-pixel groups by
+   (VBS + 1) lines, from the frame buffer's first pixel, one byte per
+   pixel; the cursor and overlays are not included.
+
+   The model brings the registers up to date when they are read or
+   written: it runs the frames shown since then (at most two; software
+   seeds them, waits a frame and reads them). */
+
+static uint32 bt_sar_step (uint32 sv, uint32 d)
+{
+uint32 f = ((sv >> 2) ^ (sv >> 4) ^ (sv >> 6) ^ (sv >> 8) ^ (sv >> 10) ^ (sv >> 12) ^
+    (sv >> 14) ^ (sv >> 16) ^ (sv >> 18) ^ (sv >> 20) ^ (sv >> 22) ^ (sv >> 23)) & 1;
+
+return ((((sv << 1) & 0xFFFFFF) | f) ^ d) & 0xFFFFFF;
+}
+
+static void bt_sar_frame (void)
+{
+uint32 w = ((lcspx_tbc[0x10C >> 2] & 0x1FF) + 1) * 4;
+uint32 h = (lcspx_tbc[TBC_VBLANK] & TBC_VMASK) + 1;
+uint32 phase = bt_reg[BT_TEST - 0x200] & 3;
+uint32 prm = bt_reg[BT_PRM - 0x200];
+uint32 x, y, i, sv = bt_sar;
+
+for (y = 0; y < h; y++) {
+    for (x = phase; x < w; x = x + 4) {
+        i = lcspx_fb[(y * w + x) & (LCSPX_FBSIZE - 1)] & prm;
+        sv = bt_sar_step (sv, (bt_cmap[i][0] | (bt_cmap[i][1] << 8) | (bt_cmap[i][2] << 16)) ^ 0xFFFFFF);
+        }
+    }
+bt_sar = sv;
+}
+
+static void bt_sar_update (void)
+{
+uint32 n;
+
+tbc_advance ();
+n = tbc_frames - bt_sar_frames;
+if (n > 2)
+    n = 2;
+if (lcspx_tbc[TBC_TCSR] & TCSR_RUN) {
+    while (n-- > 0)
+        bt_sar_frame ();
+    }
+bt_sar_frames = tbc_frames;
 }
 
 /* Bt459: the colour triple at an address, or NULL for a single register */
@@ -703,6 +797,10 @@ switch (port) {
             }
         if (bt_addr == 0x200)                           /* ID */
             v = BT_ID;
+        else if ((bt_addr >= BT_SAR) && (bt_addr <= BT_SAR + 2)) {  /* signature */
+            bt_sar_update ();
+            v = (bt_sar >> ((bt_addr - BT_SAR) * 8)) & 0xFF;
+            }
         else v = *bt_single (bt_addr);
         bt_step (FALSE);
         return v;
@@ -734,7 +832,11 @@ switch (port) {
             bt_step (TRUE);
             break;
             }
-        if (bt_addr != 0x200)                           /* the ID is read only */
+        if ((bt_addr >= BT_SAR) && (bt_addr <= BT_SAR + 2)) {  /* seed the signature */
+            bt_sar_update ();
+            bt_sar = (bt_sar & ~(0xFFu << ((bt_addr - BT_SAR) * 8))) | (v << ((bt_addr - BT_SAR) * 8));
+            }
+        else if (bt_addr != 0x200)                      /* the ID is read only */
             *bt_single (bt_addr) = (uint8) v;
         bt_step (FALSE);
         break;
@@ -750,6 +852,8 @@ switch (port) {
         2019    fill the rectangle with FG (with COMMAND<15>: a trapezoid)
         201A    copy a rectangle from SRCPIX
         2099    draw a vector
+        201F    write the rectangle from FIFO data (streaming in)
+        201E    read the rectangle into a FIFO (streaming out)
    The rectangle's edges are XSTART..XEND and YSTART..YEND (pixels, in
    <31:16>); COMMAND<0> and <1> draw right to left and bottom to top, the
    columns from XEND to XSTART - 1 and the rows from YEND to YSTART - 1.
@@ -776,6 +880,7 @@ switch (port) {
    clears the status after it starts the operation, then waits). */
 
 #define CVI_SPDONE      0x00000002                      /* scan processor done */
+
 
 static uint32 sp_reg (uint32 o)
 {
@@ -1070,9 +1175,76 @@ for (maj = x0, min = y0; maj <= last; ) {
 return n;
 }
 
+/* Streaming (entries 201F and 201E; subtests 28 and 29)
+
+   The rectangle runs from XSTART to XEND and YSTART to YEND, both
+   inclusive, from DSTPIX (in) or SRCPIX (out), and is taken row by row,
+   one frame-buffer longword (four 8-bit pixels) per FIFO entry.
+   Streaming in, the scan processor takes the data entries of the FIFO
+   that the TBC routes to it (the entries with no address entry before
+   them); streaming out, it appends the longwords to the FIFO that
+   TBC +004<26:24> names (4 + k).  Each pixel is written as it comes: the
+   logical function does not apply. */
+
+static int32 sp_stream_size (uint32 *w)
+{
+int32 xs = (int16) (sp_reg (SP_XSTART) >> 16), xe = (int16) (sp_reg (SP_XEND) >> 16);
+int32 ys = (int16) (sp_reg (SP_YSTART) >> 16), ye = (int16) (sp_reg (SP_YEND) >> 16);
+
+if ((xe < xs) || (ye < ys))
+    return 0;
+*w = (uint32) (xe - xs + 1);
+return (xe - xs + 1) * (ye - ys + 1);
+}
+
+static t_bool sp_stream_in (uint32 v)
+{
+uint32 depth = sp_reg (SP_DSTPIX) >> 30;
+uint32 stride = sp_reg (SP_STRIDE) & 0xFFFF;
+uint32 base = sp_reg (SP_DSTPIX) & PIX_INDEX;
+uint32 per = 4 >> depth, k, bits = 8 << depth;
+
+if (sp_in_left <= 0)
+    return FALSE;
+for (k = 0; (k < per) && (sp_in_left > 0); k++, sp_in_left--) {
+    fb_putpix (base + sp_in_x + sp_in_y * stride, depth,
+        (bits == 32)? v: ((v >> (k * bits)) & ((1u << bits) - 1)));
+    if (++sp_in_x >= sp_in_w) {
+        sp_in_x = 0;
+        sp_in_y++;
+        }
+    }
+return TRUE;
+}
+
+static int32 sp_stream_out (void)
+{
+uint32 depth = sp_reg (SP_SRCPIX) >> 30;
+uint32 stride = sp_reg (SP_STRIDE) >> 16;
+uint32 base = sp_reg (SP_SRCPIX) & PIX_INDEX;
+uint32 per = 4 >> depth, bits = 8 << depth;
+uint32 sel = (lcspx_tbc[TBC_ROUTE] >> 24) & 7;
+uint32 w, x, y, k, v;
+int32 n, i;
+
+n = sp_stream_size (&w);
+if ((sel & 4) == 0)                                     /* no FIFO named */
+    return n;
+for (i = 0, x = y = 0; i < n; ) {
+    for (k = 0, v = 0; (k < per) && (i < n); k++, i++) {
+        v = v | (fb_getpix (base + x + y * stride, depth) << (k * bits));
+        if (++x >= w) {
+            x = 0;
+            y++;
+            }
+        }
+    fifo_put (sel & 3, v, FALSE);
+    }
+return n;
+}
+
 /* The microprogram counter was written: run the operation */
 
-#define SP_DONE_MIN     50                              /* instructions to "done", at least */
 #define SP_PIX_PER_INSTR 8                              /* and per pixel drawn */
 
 static void sp_start (uint32 mpc)
@@ -1091,6 +1263,18 @@ switch (mpc & 0xFFFF) {
 
     case MPC_VECTOR:
         n = sp_vector ();
+        break;
+
+    case MPC_STREAMIN:
+        sp_in_left = n = sp_stream_size (&sp_in_w);
+        sp_in_x = sp_in_y = 0;
+        fifo_drain ();                                  /* the data may be waiting */
+        if (sp_in_left > 0)                             /* done when the last pixel comes */
+            return;
+        break;
+
+    case MPC_STREAMOUT:
+        n = sp_stream_out ();
         break;
 
     default:
@@ -1201,6 +1385,8 @@ if ((off - LCSPX_ROM) < LCSPX_ROMSIZE) {                /* option ROM */
     sim_debug (DBG_ROM, &lcspx_dev, "ROM read %05X = %08X\n", off - LCSPX_ROM, v);
     return (int32) v;
     }
+if ((off - LCSPX_SP2) < LCSPX_SPSIZE)                   /* the scan processor again */
+    off = off - LCSPX_SP2 + LCSPX_SP;
 if ((off - LCSPX_SP) < LCSPX_SPSIZE) {                  /* scan processor */
     v = sp_rd ((off - LCSPX_SP) & ~3u);
     sim_debug (DBG_REG, &lcspx_dev, "SP read %05X = %08X, PC %08X\n", off - LCSPX_SP, v, fault_PC);
@@ -1278,6 +1464,8 @@ if (((off - LCSPX_CMD) < (FIFO_N * LCSPX_CMDSTEP)) &&   /* a FIFO's command wind
         }
     return;
     }
+if ((off - LCSPX_SP2) < LCSPX_SPSIZE)                   /* the scan processor again */
+    off = off - LCSPX_SP2 + LCSPX_SP;
 if ((off - LCSPX_SP) < LCSPX_SPSIZE) {                  /* scan processor */
     sim_debug (DBG_REG, &lcspx_dev, "SP write %05X = %08X (%d), PC %08X\n", off - LCSPX_SP, val, lnt, fault_PC);
     sp_wr ((off - LCSPX_SP) & ~3u, pa, val, lnt);
@@ -1311,6 +1499,8 @@ return;                                                 /* the ROM and the holes
 
 t_stat lcspx_reset (DEVICE *dptr)
 {
+int32 i;
+
 if (lcspx_fb == NULL) {
     lcspx_fb = (uint8 *) calloc (LCSPX_FBSIZE, sizeof (uint8));
     if (lcspx_fb == NULL)
@@ -1328,7 +1518,9 @@ memset (lcspx_fifomem, 0, sizeof (lcspx_fifomem));
 memset (fifo_wp, 0, sizeof (fifo_wp));
 memset (fifo_rp, 0, sizeof (fifo_rp));
 memset (fifo_cnt, 0, sizeof (fifo_cnt));
-memset (fifo_dest, 0, sizeof (fifo_dest));
+for (i = 0; i < FIFO_N; i++)
+    fifo_dest[i] = FIFO_NODEST;
+sp_in_left = 0;
 memset (lcspx_fifotag, 0, sizeof (lcspx_fifotag));
 bt_addr = bt_m3 = 0;
 return SCPE_OK;

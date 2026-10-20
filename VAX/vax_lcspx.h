@@ -42,6 +42,7 @@
 #define LCSPX_CMDSIZE   0x00300000
 #define LCSPX_SP        0x01300000                      /* scan processor (pixel engine) */
 #define LCSPX_SPSIZE    0x00100000                      /* 512 KB, and a diagnostic view */
+#define LCSPX_SP2       0x01700000                      /* the scan processor again */
 #define LCSPX_TBC       0x01B00000                      /* TBC: timing and bus controller */
 #define LCSPX_TBCSIZE   0x00000400
 #define LCSPX_BT        0x01B10000                      /* Bt459 RAMDAC: four ports */
