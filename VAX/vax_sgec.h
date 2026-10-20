@@ -29,10 +29,16 @@
 
    SGEC_SET_INT         the SGEC's interrupt request is asserted
    SGEC_CLR_INT         ... and removed
+   SGEC_GET_MAC(m)      copy the station address (ETH_MAC) into m
+   SGEC_SET_MAC(m)      set the station address from m
 
    The request is a level: it stays asserted while CSR5 has an interrupt
    status bit set and CSR6<IE> is set.  The DMA goes to physical memory
-   (descriptors, buffers and page tables), checked with ADDR_IS_MEM.
+   (descriptors, buffers and page tables), checked with ADDR_IS_MEM.  The
+   station address belongs to the board (its network address ROM), not to
+   the SGEC, which learns it from the setup frames software gives it; the
+   two MAC hooks let SET SGEC MAC= change the board's ROM and let the
+   attach check the network for a duplicate.
 */
 
 #ifndef VAX_SGEC_H_
