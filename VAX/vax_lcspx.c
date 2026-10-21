@@ -83,9 +83,10 @@
    option ROM header: the graphics test then reports "?? 016 2 UNK 0014"
    and the console goes on.
 
-   SET LCSPX MONITOR connects a monitor (NOMONITOR, the default, as on
-   the author's 4000/90, leaves the outputs unterminated, which the
-   option's self-test notices).  With a monitor the model shows the
+   SET LCSPX MONITOR terminates the video outputs, as a monitor or a
+   terminated video cable does (NOMONITOR, the default, as on the
+   author's headless 4000/90, leaves them unterminated, which the
+   option's self-test notices).  With MONITOR the model shows the
    display in a window, when the simulator is built with video (SDL) and
    the host has a display; the keyboard and mouse of that window go to
    the LK401 and VSXXX devices (vax_lk.c, vax_vs.c).  SET LCSPX
@@ -420,7 +421,7 @@ const char *lcspx_description (DEVICE *dptr);
    lcspx_reg    LCSPX register list
 */
 
-#define UNIT_V_MONITOR  (UNIT_V_UF + 0)                 /* a monitor is connected */
+#define UNIT_V_MONITOR  (UNIT_V_UF + 0)                 /* the video outputs are terminated */
 #define UNIT_MONITOR    (1u << UNIT_V_MONITOR)
 
 UNIT lcspx_units[] = {
@@ -432,8 +433,8 @@ UNIT lcspx_units[] = {
 #define lcspx_disp      lcspx_units[1]
 
 MTAB lcspx_mod[] = {
-    { UNIT_MONITOR, UNIT_MONITOR, "monitor", "MONITOR", &lcspx_set_monitor, NULL, NULL, "A monitor is connected (a window, with video)" },
-    { UNIT_MONITOR, 0, "no monitor", "NOMONITOR", &lcspx_set_monitor, NULL, NULL, "No monitor is connected (the default, as on the author's 4000/90)" },
+    { UNIT_MONITOR, UNIT_MONITOR, "monitor", "MONITOR", &lcspx_set_monitor, NULL, NULL, "A monitor or a terminated video cable is connected (a window, with video)" },
+    { UNIT_MONITOR, 0, "no monitor", "NOMONITOR", &lcspx_set_monitor, NULL, NULL, "Nothing terminates the video outputs (the default, as on the author's headless 4000/90)" },
     { MTAB_XTD|MTAB_VDV|MTAB_NC, 0, NULL, "SCREENSHOT", &lcspx_screenshot, NULL, NULL, "Write the picture to a PNG file: SCREENSHOT=file" },
     { MTAB_XTD|MTAB_VDV, 0, "ROM", NULL, NULL, &lcspx_show_rom, NULL, "Show which option ROM image is in use" },
     { 0 }
@@ -834,11 +835,12 @@ bt_sar_frames = tbc_frames;
    the sync it carries (<7>).  The voltage per IRE unit depends on the
    load: the option ROM's subtest 32 first compares red at code 10
    with the reference and takes the smaller of two sets of test levels
-   when red is above it.  The model uses 7.14 mV per IRE unit with a
-   monitor (the RS-343 level into the monitor's 75 ohms and the board's)
-   and twice that without one (no far-end termination).  Then the real
-   machines' results follow: with a monitor (the 4000/96) every check
-   passes; without one (the 4000/90) red 10 is above the reference, the
+   when red is above it.  The model uses 7.14 mV per IRE unit with the
+   outputs terminated (the RS-343 level into a far-end 75 ohms, a
+   monitor's or a terminated cable's, and the board's) and twice that
+   without (no far-end termination).  Then the results follow: terminated,
+   every check passes; unterminated (the author's headless 4000/90, whose
+   readings the model reproduces) red 10 is above the reference, the
    smaller set leaves green with its sync above blue where the test wants
    it below, and the test fails at its error 6 with both readings 68. */
 
@@ -1990,10 +1992,11 @@ fprintf (st, "C000xxxx per 16-bit word) or the logical ROM (131072 bytes).  DETA
 fprintf (st, "goes back to the built-in image.  An empty file takes the ROM away: it then\n");
 fprintf (st, "reads as zero and the console reports the graphics as UNK.  SHOW LCSPX ROM\n");
 fprintf (st, "says which image is in use.\n\n");
-fprintf (st, "SET LCSPX MONITOR says that a monitor is connected; NOMONITOR, the\n");
-fprintf (st, "default, that none is, as on the author's VAXstation 4000/90: the console\n");
-fprintf (st, "then reports the graphics as \"?? 001 0512\" (its Bt459 analog compare test\n");
-fprintf (st, "needs a monitor).  SET LCSPX DISABLED removes the option altogether.\n");
+fprintf (st, "SET LCSPX MONITOR says that a monitor or a terminated video cable is\n");
+fprintf (st, "connected; NOMONITOR, the default, that nothing terminates the video\n");
+fprintf (st, "outputs, as on the author's headless VAXstation 4000/90: the console then\n");
+fprintf (st, "reports the graphics as \"?? 001 0512\" (its Bt459 analog compare test needs\n");
+fprintf (st, "terminated outputs).  SET LCSPX DISABLED removes the option altogether.\n");
 fprint_set_help (st, dptr);
 fprint_show_help (st, dptr);
 fprint_reg_help (st, dptr);
