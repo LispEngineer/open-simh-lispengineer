@@ -144,13 +144,18 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
    diagnostic view of it.  In the normal view:
         2100-21FC, 2200-22FC    the register file: register i (0-63) is
                                 at 2200 + 4i for i < 32, else 2100 + 4i
-        2100                    <31:24>: nonzero when the microcode is in
-                                the chip, zero when the console must load
-                                it (its init routine and several subtests
-                                take the one path or the other); the
-                                model says 01, the path NetBSD's driver
-                                assumes (read only; the real board's
-                                value is not known)
+        2100                    read only.  <31:24>: nonzero when the
+                                microcode is in the chip, zero when the
+                                console must load it (its init routine
+                                and several subtests take the one path or
+                                the other, reading only this byte); <9>:
+                                a status the console's resident driver
+                                waits for in one routine that a serial-
+                                console machine never runs; <8>: set,
+                                meaning unknown.  A real 4000/90 with no
+                                monitor read 01000100 at its console
+                                (E/P/L 39302100, 2026-10-21), which the
+                                model returns
         212C                    microcode address <25:16> and the
                                 microword's bits <47:32>; reads give the
                                 address and bits <47:32> of the word
@@ -191,7 +196,7 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
 #define SP_UCSIZE       1024                            /* microcode words */
 #define SP_REFRESH      0x31A8                          /* refresh counter */
 #define SP_ID           0x2100                          /* <31:24> nonzero: microcode in the chip */
-#define SP_ID_INIT      0x01000000
+#define SP_ID_INIT      0x01000100
 #define SP_XSTART       0x21D0                          /* edges, <31:16> */
 #define SP_YSTART       0x21D4
 #define SP_XEND         0x21D8
