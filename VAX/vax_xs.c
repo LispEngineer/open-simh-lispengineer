@@ -491,12 +491,12 @@ while (xs->var->ReadQ.count > 0) {
 void xs_process_transmit (CTLR* xs)
 {
 uint32 segb, ba;
-int slen, wlen, off, giant;
+int slen, wlen, off, flen, giant;
 t_stat rstatus, wstatus;
 
 /* sim_debug(DBG_TRC, xs->dev, "xs_process_transmit()\n"); */
 
-off = giant = 0;
+off = flen = giant = 0;
 for (;;) {
 
     /* get next transmit buffer */
@@ -526,14 +526,13 @@ for (;;) {
     /* prepare to accumulate transmit information if start of frame */
     if (xs->var->txhdr[1] & TXR_STF) {
         memset(&xs->var->write_buffer, 0, sizeof(ETH_PACK));
-        off = giant = 0;
+        off = flen = giant = 0;
         }
 
     /* get packet data from host */
-    if (xs->var->write_buffer.len + slen > ETH_MAX_PACKET) {
+    flen += slen;                                       /* the frame's length as the host built it */
+    if (xs->var->write_buffer.len + slen > ETH_MAX_PACKET)
         wlen = ETH_MAX_PACKET - xs->var->write_buffer.len;
-        giant = 1;
-        }
     if (wlen > 0) {
         rstatus = XS_READB(segb, wlen, &xs->var->write_buffer.msg[off]);
         if (rstatus) {
@@ -548,8 +547,19 @@ for (;;) {
     /* transmit packet when end-of-frame is reached */
     if (xs->var->txhdr[1] & TXR_ENF) {
 
+        /* A frame longer on the wire than the maximum (1518 bytes with its CRC,
+           which the chip appends unless MODE<DTCR>) is babble: the chip sends it
+           whole, sets CSR0<BABL> once 1519 bytes have gone out, and reports
+           nothing in the descriptor (TMD1<ERR> sums LCOL, LCAR, UFLO and RTRY
+           only). No station accepts such a frame and the host network cannot
+           carry it, so it is not sent - nor truncated to a frame that would be
+           accepted. */
+        giant = (flen + ((xs->var->mode & MODE_DTCR) ? 0 : ETH_CRC_SIZE) > ETH_FRAME_SIZE);
+        if (giant)
+            xs->var->csr0 |= CSR0_BABL;
+
         /* are we in internal loopback mode ? */
-        if ((xs->var->mode & MODE_LOOP) && (xs->var->mode & MODE_INTL)) {
+        else if ((xs->var->mode & MODE_LOOP) && (xs->var->mode & MODE_INTL)) {
             /* just put packet in receive buffer, as it was sent: not padded, and
                with the CRC the chip appends, in the form the receive path expects
                of a frame from the network (which it reverses into the chip's byte
@@ -597,7 +607,7 @@ for (;;) {
            MODE<DTCR> no CRC is appended: the frame's own last four bytes are
            taken as its CRC, already in the chip's order. A frame that was not
            sent (unattached) is not echoed, as on a machine with no cable. */
-        if (((xs->var->mode & (MODE_LOOP | MODE_INTL)) == MODE_LOOP) &&
+        if (((xs->var->mode & (MODE_LOOP | MODE_INTL)) == MODE_LOOP) && !giant &&
             (wstatus == SCPE_OK) && (xs->var->write_buffer.status == 0)) {
             xs->var->write_buffer.len = off;
             xs->var->write_buffer.crc_len = 0;
@@ -621,12 +631,6 @@ for (;;) {
             const uint16 tdr = 100 + wlen * 8; /* arbitrary value */
             xs->var->txhdr[3] |= TXR_RTRY;
             xs->var->txhdr[3] |= tdr & TXR_TDR;
-            xs->var->txhdr[1] |= TXR_ERRS;
-            }
-
-        /* was packet too big? */
-        if (giant) {
-            xs->var->txhdr[3] |= TXR_BUFL;
             xs->var->txhdr[1] |= TXR_ERRS;
             }
 
