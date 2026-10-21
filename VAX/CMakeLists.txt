@@ -790,6 +790,7 @@ add_simulator(vaxstation4000m90
         VM_VAX
         VAX_49
     FEATURE_FULL64
+    FEATURE_VIDEO
     USES_AIO
     BUILDROMS
     LABEL VAX
