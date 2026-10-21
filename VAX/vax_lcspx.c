@@ -73,12 +73,15 @@
    Any other reference in the window is absent: a read machine-checks, as
    for any address nothing answers, and a write is dropped.
 
-   The option ROM is DEC's firmware, so it is not part of this simulator;
-   ATTACH LCSPX <file> loads it, either as dumped (256 KB of longwords,
-   each C000xxxx) or as the 128 KB logical byte stream (lane 0, then lane
-   1, of each longword).  Without a file the ROM window reads zero, which
-   the console rejects as an invalid option ROM header: the graphics test
-   then reports "?? 016 2 UNK 0014" and the console goes on.
+   The option ROM, DEC's firmware, is built in: vax_lcspx_bin.h, which
+   sim_BuildROMs makes from lcspx.bin, the ROM of a VAXstation 4000/90 as
+   its CPU reads it.  ATTACH LCSPX <file> replaces it with another image,
+   either as dumped (256 KB of longwords, each C000xxxx) or as the 128 KB
+   logical byte stream (lane 0, then lane 1, of each longword); DETACH
+   LCSPX goes back to the built-in image.  Attaching an empty file leaves
+   the ROM window reading zero, which the console rejects as an invalid
+   option ROM header: the graphics test then reports "?? 016 2 UNK 0014"
+   and the console goes on.
 
    SET LCSPX MONITOR connects a monitor (NOMONITOR, the default, as on
    the author's 4000/90, leaves the outputs unterminated, which the
@@ -97,6 +100,7 @@
 #include "sim_video.h"
 #include "vax_lk.h"
 #include "vax_vs.h"
+#include "vax_lcspx_bin.h"                              /* the built-in option ROM, vax_lcspx_bin */
 #if defined (HAVE_LIBPNG)
 #include <png.h>
 #endif
@@ -126,7 +130,8 @@
 #define DBG_FB          0x0004                          /* frame-buffer access */
 #define DBG_SP          0x0008                          /* scan processor operations */
 
-static uint16 *lcspx_rom = NULL;                        /* option ROM, one word per longword */
+static uint16 *lcspx_rom = NULL;                        /* option ROM, one word per longword;
+                                                           NULL: an empty file is attached */
 static uint8 *lcspx_fb = NULL;                          /* frame buffer */
 static t_bool lcspx_dirty = TRUE;                       /* the picture has changed */
 static uint32 lcspx_sp[LCSPX_SPSIZE >> 3];              /* scan processor space */
@@ -390,6 +395,8 @@ t_stat lcspx_svc (UNIT *uptr);
 t_stat lcspx_disp_svc (UNIT *uptr);
 t_stat lcspx_set_monitor (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
 t_stat lcspx_screenshot (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+t_stat lcspx_show_rom (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
+static t_stat lcspx_rom_builtin (void);
 static t_stat lcspx_display (void);
 static void lcspx_wroff (uint32 off, int32 pa, int32 val, int32 lnt);
 static void tbc_advance (void);
@@ -428,6 +435,7 @@ MTAB lcspx_mod[] = {
     { UNIT_MONITOR, UNIT_MONITOR, "monitor", "MONITOR", &lcspx_set_monitor, NULL, NULL, "A monitor is connected (a window, with video)" },
     { UNIT_MONITOR, 0, "no monitor", "NOMONITOR", &lcspx_set_monitor, NULL, NULL, "No monitor is connected (the default, as on the author's 4000/90)" },
     { MTAB_XTD|MTAB_VDV|MTAB_NC, 0, NULL, "SCREENSHOT", &lcspx_screenshot, NULL, NULL, "Write the picture to a PNG file: SCREENSHOT=file" },
+    { MTAB_XTD|MTAB_VDV, 0, "ROM", NULL, NULL, &lcspx_show_rom, NULL, "Show which option ROM image is in use" },
     { 0 }
     };
 
@@ -1519,7 +1527,7 @@ if (off < LCSPX_FBSIZE) {                               /* frame buffer */
     return (int32) v;
     }
 if ((off - LCSPX_ROM) < LCSPX_ROMSIZE) {                /* option ROM */
-    if (lcspx_rom == NULL)                              /* no file: reads zero */
+    if (lcspx_rom == NULL)                              /* an empty file: reads zero */
         return 0;
     v = LCSPX_ROMHI | lcspx_rom[(off - LCSPX_ROM) >> 2];
     if ((sim_gtime () - sp_treset) < SP_RESET_INSTR)  /* the scan processor is still resetting */
@@ -1649,6 +1657,9 @@ if (lcspx_fb == NULL) {
     if (lcspx_fb == NULL)
         return SCPE_MEM;
     }
+if ((lcspx_rom == NULL) && !(lcspx_unit.flags & UNIT_ATT) &&   /* no ROM yet: */
+    (lcspx_rom_builtin () != SCPE_OK))                  /* the built-in one */
+    return SCPE_MEM;
 memset (lcspx_sp, 0, sizeof (lcspx_sp));
 memset (sp_lanes, 0, sizeof (sp_lanes));
 lcspx_sp[SP_ID >> 2] = SP_ID_INIT;
@@ -1852,7 +1863,7 @@ return sim_messagef (SCPE_NOFNC, "%s: this simulator was built without PNG suppo
 #endif
 }
 
-/* Attach the option ROM file
+/* The option ROM image
 
    Two forms are accepted:
         262144 bytes    the ROM as the CPU reads it (a dump of
@@ -1860,7 +1871,36 @@ return sim_messagef (SCPE_NOFNC, "%s: this simulator was built without PNG suppo
                         bits <31:16> should read C000 and are not kept
         131072 bytes    the logical ROM: a byte stream, two bytes per
                         longword, lane 0 (bits <7:0>) first
-*/
+   The built-in image (lcspx.bin) is of the first form.  lcspx_rom_fill
+   returns the number of longwords whose bits <31:16> do not read C000. */
+
+static uint32 lcspx_rom_fill (const uint8 *buf, size_t len)
+{
+uint32 i, odd = 0;
+
+for (i = 0; i < LCSPX_ROMWORDS; i++) {
+    if (len == LCSPX_ROMSIZE) {                         /* as read: little-endian longwords */
+        lcspx_rom[i] = buf[4 * i] | (buf[4 * i + 1] << 8);
+        if ((buf[4 * i + 2] != 0x00) || (buf[4 * i + 3] != 0xC0))
+            odd++;
+        }
+    else lcspx_rom[i] = buf[2 * i] | (buf[2 * i + 1] << 8);
+    }
+return odd;
+}
+
+static t_stat lcspx_rom_builtin (void)
+{
+if (lcspx_rom == NULL)
+    lcspx_rom = (uint16 *) calloc (LCSPX_ROMWORDS, sizeof (uint16));
+if (lcspx_rom == NULL)
+    return SCPE_MEM;
+lcspx_rom_fill (vax_lcspx_bin, sizeof (vax_lcspx_bin));
+return SCPE_OK;
+}
+
+/* Attach an option ROM file in place of the built-in image; an empty
+   file takes the ROM away (the window reads zero) */
 
 t_stat lcspx_attach (UNIT *uptr, CONST char *cptr)
 {
@@ -1868,12 +1908,22 @@ FILE *f;
 uint8 *buf;
 long len;
 t_stat r;
-uint32 i, odd = 0;
+uint32 odd;
 
 f = sim_fopen (cptr, "rb");
 if (f == NULL)
     return sim_messagef (SCPE_OPENERR, "%s: cannot open %s\n", sim_dname (&lcspx_dev), cptr);
 len = (long) sim_fsize (f);
+if (len == 0) {                                         /* empty: no ROM */
+    fclose (f);
+    r = attach_unit (uptr, cptr);
+    if (r != SCPE_OK)
+        return r;
+    free (lcspx_rom);
+    lcspx_rom = NULL;
+    return sim_messagef (SCPE_OK, "%s: %s is empty; the option ROM reads zero\n",
+        sim_dname (&lcspx_dev), cptr);
+    }
 if ((len != LCSPX_ROMSIZE) && (len != (LCSPX_ROMSIZE >> 1))) {
     fclose (f);
     return sim_messagef (SCPE_ARG, "%s: %s is %ld bytes; the option ROM is %d (as read) or %d (logical)\n",
@@ -1893,14 +1943,12 @@ if (r != SCPE_OK) {
     }
 if (lcspx_rom == NULL)
     lcspx_rom = (uint16 *) calloc (LCSPX_ROMWORDS, sizeof (uint16));
-for (i = 0; i < LCSPX_ROMWORDS; i++) {
-    if (len == LCSPX_ROMSIZE) {                         /* as read: little-endian longwords */
-        lcspx_rom[i] = buf[4 * i] | (buf[4 * i + 1] << 8);
-        if ((buf[4 * i + 2] != 0x00) || (buf[4 * i + 3] != 0xC0))
-            odd++;
-        }
-    else lcspx_rom[i] = buf[2 * i] | (buf[2 * i + 1] << 8);
+if (lcspx_rom == NULL) {
+    free (buf);
+    detach_unit (uptr);
+    return SCPE_MEM;
     }
+odd = lcspx_rom_fill (buf, (size_t) len);
 free (buf);
 if (odd)
     sim_messagef (SCPE_OK, "%s: %u longwords of %s do not read C000 in bits <31:16>\n",
@@ -1908,11 +1956,25 @@ if (odd)
 return SCPE_OK;
 }
 
+/* Detach: back to the built-in image */
+
 t_stat lcspx_detach (UNIT *uptr)
 {
-free (lcspx_rom);
-lcspx_rom = NULL;
-return detach_unit (uptr);
+t_stat r = detach_unit (uptr);
+
+if (r != SCPE_OK)
+    return r;
+return lcspx_rom_builtin ();
+}
+
+t_stat lcspx_show_rom (FILE *st, UNIT *uptr, int32 val, CONST void *desc)
+{
+if (!(lcspx_unit.flags & UNIT_ATT))
+    fprintf (st, "built-in option ROM");
+else if (lcspx_rom == NULL)
+    fprintf (st, "no option ROM (empty file %s)", lcspx_unit.filename);
+else fprintf (st, "option ROM from %s", lcspx_unit.filename);
+return SCPE_OK;
 }
 
 t_stat lcspx_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *cptr)
@@ -1920,11 +1982,14 @@ t_stat lcspx_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *c
 fprintf (st, "LCSPX 8-plane graphics option (%s)\n\n", dptr->name);
 fprintf (st, "The LCSPX is the colour graphics option of the VAXstation 4000 Model 90.\n");
 fprintf (st, "Its option ROM, DEC firmware that the console reads and runs at power-up,\n");
-fprintf (st, "is not part of the simulator; load a dump of it with\n\n");
+fprintf (st, "is built in (a dump of the ROM of a VAXstation 4000/90).  Another image\n");
+fprintf (st, "replaces it with\n\n");
 fprintf (st, "   sim> ATTACH LCSPX <file>\n\n");
 fprintf (st, "The file is either the ROM as the CPU reads it (262144 bytes, one longword\n");
-fprintf (st, "C000xxxx per 16-bit word) or the logical ROM (131072 bytes).  Without it\n");
-fprintf (st, "the ROM reads as zero and the console reports the graphics as UNK.\n\n");
+fprintf (st, "C000xxxx per 16-bit word) or the logical ROM (131072 bytes).  DETACH LCSPX\n");
+fprintf (st, "goes back to the built-in image.  An empty file takes the ROM away: it then\n");
+fprintf (st, "reads as zero and the console reports the graphics as UNK.  SHOW LCSPX ROM\n");
+fprintf (st, "says which image is in use.\n\n");
 fprintf (st, "SET LCSPX MONITOR says that a monitor is connected; NOMONITOR, the\n");
 fprintf (st, "default, that none is, as on the author's VAXstation 4000/90: the console\n");
 fprintf (st, "then reports the graphics as \"?? 001 0512\" (its Bt459 analog compare test\n");
