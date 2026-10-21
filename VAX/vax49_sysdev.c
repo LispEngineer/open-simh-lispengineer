@@ -96,19 +96,23 @@ CTAB vax49_cmd[] = {
    PCCTL<9> read as 1 on a real 4000/90 and 0 on a real 4000/96 (the
    VMS error log prints "pcache redundancy elements enabled" for one and not
    the other); it is a read-only property of the chip, recorded per model.
-   The 90A value is a guess. */
+   CEFSTS and NEICMD with nothing latched differ between the two real
+   machines too (see TBSTS_IDLE below) and are recorded per model.  The 90A
+   values are guesses (the 90's). */
 
 typedef struct {
     const char  *name;                                  /* SET CPU MODEL= name */
     const char  *sim_name;                              /* simulator name */
     uint32      patch;                                  /* SID<13:9> patch revision */
     uint32      pcctl_red;                              /* PCCTL<9> */
+    uint32      cefsts;                                 /* CEFSTS, nothing latched */
+    uint32      neicmd;                                 /* NEICMD, nothing latched */
     } KA49_MODEL;
 
 static const KA49_MODEL ka49_models[] = {
-    { "90",  "VAXstation 4000-90 (KA49)",  27, 1 },
-    { "90A", "VAXstation 4000-90A (KA49)", 19, 1 },
-    { "96",  "VAXstation 4000-96 (KA49)",  11, 0 },
+    { "90",  "VAXstation 4000-90 (KA49)",  27, 1, 0x00006FA0, 0x00000040 },
+    { "90A", "VAXstation 4000-90A (KA49)", 19, 1, 0x00006FA0, 0x00000040 },
+    { "96",  "VAXstation 4000-96 (KA49)",  11, 0, 0x00007FE0, 0x00000000 },
     { NULL }
     };
 
@@ -194,6 +198,19 @@ int32 sys_model = 0;                                    /* no graphics console *
 #define PCSCR_V_PATCH   24                              /* patch revision <28:24> */
 #define PCSCR_M_PATCH   0x1F
 #define PAMODE_32       0x00000001                      /* 32-bit physical addressing */
+
+/* TBSTS, CEFSTS, NEOCMD and NEICMD with no error latched.  Their lock and
+   error bits are clear (the console clears CEFSTS<4:0> and TBSTS<0> by
+   writing ones); the other bits are fields of the last TB, Cbox fill and
+   NDAL transactions, which the model does not track.  It returns what the
+   real machines show in every VMS error-log subpacket and in SDA's
+   register block of a crash dump: on a 4000/90 (2026-10-10 to 2026-10-21)
+   TBSTS 800001D0, CEFSTS 00006FA0, NEOCMD 0000FF14 and NEICMD 00000040
+   (00000046 in the entries before 2026-10-20); on a 4000/96 the same but
+   CEFSTS 00007FE0 and NEICMD 00000000 (per model, ka49_models). */
+
+#define TBSTS_IDLE      0x800001D0
+#define NEOCMD_IDLE     0x0000FF14
 
 /* CCTL: Bcache control.  The bits the console's cache test uses, as the
    test shows them to behave:
@@ -799,13 +816,21 @@ switch (rg) {
         break;
 
     case MT_BCETIDX: case MT_BCETAG: case MT_BCEDIDX:
-    case MT_CEFADR: case MT_NEOADR: case MT_NEOCMD:
-    case MT_NEDATHI: case MT_NEDATLO: case MT_NEICMD:
+    case MT_CEFADR: case MT_NEOADR:
+    case MT_NEDATHI: case MT_NEDATLO:
         val = 0;
         break;
 
+    case MT_NEOCMD:                                     /* last NDAL commands */
+        val = NEOCMD_IDLE;
+        break;
+
+    case MT_NEICMD:
+        val = ka49_models[ka49_model].neicmd;
+        break;
+
     case MT_CEFSTS:
-        val = ka_cefsts;
+        val = ka49_models[ka49_model].cefsts | ka_cefsts;
         break;
 
     case MT_NESTS:
@@ -869,8 +894,12 @@ switch (rg) {
         break;
 
     case MT_MMEADR: case MT_MMEPTE: case MT_MMESTS:
-    case MT_TBADR: case MT_TBSTS: case MT_PCADR:
+    case MT_TBADR: case MT_PCADR:
         val = 0;
+        break;
+
+    case MT_TBSTS:
+        val = TBSTS_IDLE;
         break;
 
     case MT_PCSTS:
