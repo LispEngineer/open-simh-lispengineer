@@ -988,6 +988,8 @@ extern int32 cpu_instruction_set;
 #include "vax43_defs.h"
 #elif defined (VAX_440)
 #include "vax440_defs.h"
+#elif defined (VAX_49)
+#include "vax49_defs.h"
 #elif defined (IS_1000)
 #include "is1000_defs.h"
 #elif defined (VAX_610)
