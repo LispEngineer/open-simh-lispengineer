@@ -491,12 +491,13 @@ while (xs->var->ReadQ.count > 0) {
 void xs_process_transmit (CTLR* xs)
 {
 uint32 segb, ba;
-int slen, wlen, off, giant;
+int slen, wlen, off, flen, giant;
+uint16 tmd3;
 t_stat rstatus, wstatus;
 
 /* sim_debug(DBG_TRC, xs->dev, "xs_process_transmit()\n"); */
 
-off = giant = 0;
+off = flen = giant = 0;
 for (;;) {
 
     /* get next transmit buffer */
@@ -523,17 +524,20 @@ for (;;) {
     sim_debug_bits(DBG_TRC, xs->dev, xs_tdes_w2, xs->var->txhdr[2], xs->var->txhdr[2], 0);
     sim_debug(DBG_TRC, xs->dev, ", pktlen=0x%X(%d), used=0x%X, wlen=0x%X\n", 0, 0, 0, wlen);
 
+    /* the chip writes TMD1's status (ERR, MORE, ONE, DEF) whole, keeping none of
+       what the host left in the descriptor */
+    xs->var->txhdr[1] &= ~(TXR_ERRS | TXR_MORE | TXR_ONE | TXR_DEF);
+
     /* prepare to accumulate transmit information if start of frame */
     if (xs->var->txhdr[1] & TXR_STF) {
         memset(&xs->var->write_buffer, 0, sizeof(ETH_PACK));
-        off = giant = 0;
+        off = flen = giant = 0;
         }
 
     /* get packet data from host */
-    if (xs->var->write_buffer.len + slen > ETH_MAX_PACKET) {
+    flen += slen;                                       /* the frame's length as the host built it */
+    if (xs->var->write_buffer.len + slen > ETH_MAX_PACKET)
         wlen = ETH_MAX_PACKET - xs->var->write_buffer.len;
-        giant = 1;
-        }
     if (wlen > 0) {
         rstatus = XS_READB(segb, wlen, &xs->var->write_buffer.msg[off]);
         if (rstatus) {
@@ -547,9 +551,21 @@ for (;;) {
 
     /* transmit packet when end-of-frame is reached */
     if (xs->var->txhdr[1] & TXR_ENF) {
+        tmd3 = 0;
+
+        /* A frame longer on the wire than the maximum (1518 bytes with its CRC,
+           which the chip appends unless MODE<DTCR>) is babble: the chip sends it
+           whole, sets CSR0<BABL> once 1519 bytes have gone out, and reports
+           nothing in the descriptor (TMD1<ERR> sums LCOL, LCAR, UFLO and RTRY
+           only). No station accepts such a frame and the host network cannot
+           carry it, so it is not sent - nor truncated to a frame that would be
+           accepted. */
+        giant = (flen + ((xs->var->mode & MODE_DTCR) ? 0 : ETH_CRC_SIZE) > ETH_FRAME_SIZE);
+        if (giant)
+            xs->var->csr0 |= CSR0_BABL;
 
         /* are we in internal loopback mode ? */
-        if ((xs->var->mode & MODE_LOOP) && (xs->var->mode & MODE_INTL)) {
+        else if ((xs->var->mode & MODE_LOOP) && (xs->var->mode & MODE_INTL)) {
             /* just put packet in receive buffer, as it was sent: not padded, and
                with the CRC the chip appends, in the form the receive path expects
                of a frame from the network (which it reverses into the chip's byte
@@ -582,7 +598,7 @@ for (;;) {
                    chip does, not CSR0<BABL>, a transmitter timeout. A failure the
                    callback already reported is left to the retry path below. */
                 if (xs->var->write_buffer.status == 0) {
-                    xs->var->txhdr[3] |= TXR_LCAR;
+                    tmd3 |= TXR_LCAR;
                     xs->var->txhdr[1] |= TXR_ERRS;
                     }
                 }
@@ -597,7 +613,7 @@ for (;;) {
            MODE<DTCR> no CRC is appended: the frame's own last four bytes are
            taken as its CRC, already in the chip's order. A frame that was not
            sent (unattached) is not echoed, as on a machine with no cable. */
-        if (((xs->var->mode & (MODE_LOOP | MODE_INTL)) == MODE_LOOP) &&
+        if (((xs->var->mode & (MODE_LOOP | MODE_INTL)) == MODE_LOOP) && !giant &&
             (wstatus == SCPE_OK) && (xs->var->write_buffer.status == 0)) {
             xs->var->write_buffer.len = off;
             xs->var->write_buffer.crc_len = 0;
@@ -619,16 +635,15 @@ for (;;) {
         if (xs->var->write_buffer.status != 0) {
             /* failure */
             const uint16 tdr = 100 + wlen * 8; /* arbitrary value */
-            xs->var->txhdr[3] |= TXR_RTRY;
-            xs->var->txhdr[3] |= tdr & TXR_TDR;
+            tmd3 |= TXR_RTRY;
+            tmd3 |= tdr & TXR_TDR;
             xs->var->txhdr[1] |= TXR_ERRS;
             }
 
-        /* was packet too big? */
-        if (giant) {
-            xs->var->txhdr[3] |= TXR_BUFL;
-            xs->var->txhdr[1] |= TXR_ERRS;
-            }
+        /* the chip writes TMD3 whole when the frame had an error, and leaves it
+           as it was when not */
+        if (tmd3)
+            xs->var->txhdr[3] = tmd3;
 
         /* tell host we transmitted a packet */
         xs->var->csr0 |= CSR0_TINT;
@@ -663,6 +678,7 @@ t_stat xs_init (CTLR* xs)
 {
 uint16 w1, w2;
 uint8 inb[0x18];
+ETH_MULTIHASH ladrf;
 
 sim_debug (DBG_TRC, &xs_dev, "xs_init() at %08X\n", fault_PC);
 
@@ -723,7 +739,17 @@ xs->var->setup.mult0 = GETL (inb, 0x8);
 xs->var->setup.mult1 = GETL (inb, 0xC);
 
 xs->var->setup.promiscuous = (xs->var->mode & MODE_PROM) ? 1 : 0;
-xs->var->setup.multicast   = ((xs->var->setup.mult0 | xs->var->setup.mult1) > 0) ? 1 : 0;
+xs->var->setup.multicast   = ((xs->var->setup.mult0 & xs->var->setup.mult1) == 0xFFFFFFFF) ? 1 : 0;
+
+/* The logical address filter LADRF<63:0> (init block bytes 8-15, bit n in
+   byte n/8): a multicast destination is accepted when the bit its hash
+   selects is set - the high 6 bits of the Ethernet CRC of the address, the
+   same hash as sim_ether's AUTODIN II filter, bit for bit. Every bit set is
+   all multicast; none set, no multicast; broadcast is always accepted. The
+   copy given to sim_ether also has broadcast's own bit (47) set, because its
+   libpcap path consults the hash for broadcast too. */
+memcpy (ladrf, &inb[0x8], sizeof (ladrf));
+ladrf[47 >> 3] |= (1 << (47 & 7));
 
 xs->var->csr0 = xs->var->csr0 | CSR0_INIT;
 xs->var->csr0 = xs->var->csr0 & ~CSR0_STOP;
@@ -732,9 +758,10 @@ xs->var->csr0 = xs->var->csr0 & ~CSR0_STOP;
 eth_copy_mac(xs->var->setup.macs[0], xs->var->mac);
 xs->var->setup.mac_count = 1;
 if (xs->var->etherface)
-    eth_filter (xs->var->etherface, xs->var->setup.mac_count,
-                &xs->var->mac, xs->var->setup.multicast,
-                xs->var->setup.promiscuous);
+    eth_filter_hash (xs->var->etherface, xs->var->setup.mac_count,
+                     &xs->var->mac, xs->var->setup.multicast,
+                     xs->var->setup.promiscuous,
+                     ((xs->var->setup.mult0 | xs->var->setup.mult1) && !xs->var->setup.multicast) ? &ladrf : NULL);
 
 sim_activate (&xs_unit, 50);
 
