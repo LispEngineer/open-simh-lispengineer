@@ -840,7 +840,7 @@ SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_seccnt sects, sectsread, new_buf_b;
 t_uint64 want;
 t_stat r;
-uint32 i;
+uint32 i, resid = 0;
 
 if ((data[1] & 0x3) == 0x3) {                           /* SILI and FIXED? */
     scsi_status (bus, STS_CHK, KEY_ILLREQ, ASC_INVCDB);
@@ -926,8 +926,7 @@ if (uptr->flags & UNIT_ATT) {
                     }
                 else {
                     scsi_debug_cmd (bus, "SILI not set - check condition\n");
-                    scsi_status_deferred (bus, STS_CHK, (KEY_OK | KEY_M_ILI), ASC_OK);
-                    bus->sense_info = (sects - sectsread);
+                    resid = (sects - sectsread);                /* reported after the status below */
                     }
                 }
             }
@@ -940,6 +939,10 @@ if (uptr->flags & UNIT_ATT) {
         scsi_debug_cmd (bus, "Read error, r = %d\n", r);
         }
         scsi_tape_status (bus, r);
+    if (resid != 0) {                                   /* underlength: the record was read, */
+        scsi_status_deferred (bus, STS_CHK, (KEY_OK | KEY_M_ILI), ASC_OK);  /* but the length was wrong */
+        bus->sense_info = resid;
+        }
     }
 else {                                                  /* no tape loaded */
     scsi_status (bus, STS_CHK, KEY_NOTRDY, ASC_NOMEDIA);
