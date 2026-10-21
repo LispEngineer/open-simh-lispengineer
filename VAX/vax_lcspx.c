@@ -43,14 +43,17 @@
    (the self-test says what every register must do), NetBSD's spx.c
    (addresses, frame-buffer layout, the Bt459 ports) and the real
    machines' console output (hardware/register-map.md and
-   learnings/m8-lcspx.md in the project that wrote this model).
+   learnings/m8-lcspx.md in the project that wrote this model).  Open
+   SIMH's vax4xx_ve.c models the SPX of the VAXstation 3100-76 and 4000
+   VLC at the same addresses; where both model something they agree.
+   Interrupts from the option to the CPU are not modelled yet.
 
    Address map, offsets from the option's base (VAXstation 4000/90:
    3800.0000):
 
         000.0000 - 03F.FFFF     frame buffer, one byte per pixel
         100.0000 - 12F.FFFF     FIFO 0's command window
-        130.0000 - 13F.FFFF     scan processor (13 8000 up: its
+        130.0000 - 13F.FFFF     scan processor (138.0000 up: its
                                 diagnostic view)
         140.0000 - 16F.FFFF     FIFO 1's command window
         170.0000 - 17F.FFFF     the scan processor again (the
