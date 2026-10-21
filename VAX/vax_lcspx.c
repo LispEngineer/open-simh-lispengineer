@@ -77,11 +77,26 @@
    the console rejects as an invalid option ROM header: the graphics test
    then reports "?? 016 2 UNK 0014" and the console goes on.
 
+   SET LCSPX MONITOR connects a monitor (NOMONITOR, the default, as on
+   the author's 4000/90, leaves the outputs unterminated, which the
+   option's self-test notices).  With a monitor the model shows the
+   display in a window, when the simulator is built with video (SDL) and
+   the host has a display; the keyboard and mouse of that window go to
+   the LK401 and VSXXX devices (vax_lk.c, vax_vs.c).  SET LCSPX
+   SCREENSHOT=<file> writes the picture the monitor would show as a PNG
+   file, with or without a window.
+
    SET LCSPX DISABLED removes the option: its window no longer answers and
    the configuration register reports no LCSPX. */
 
 #include "vax_defs.h"
 #include "vax_lcspx.h"
+#include "sim_video.h"
+#include "vax_lk.h"
+#include "vax_vs.h"
+#if defined (HAVE_LIBPNG)
+#include <png.h>
+#endif
 
 #if !defined (LCSPX_BASE)
 #error "the model must define LCSPX_BASE, the option's window in I/O space"
@@ -110,6 +125,7 @@
 
 static uint16 *lcspx_rom = NULL;                        /* option ROM, one word per longword */
 static uint8 *lcspx_fb = NULL;                          /* frame buffer */
+static t_bool lcspx_dirty = TRUE;                       /* the picture has changed */
 static uint32 lcspx_sp[LCSPX_SPSIZE >> 3];              /* scan processor space */
 static uint32 sp_lanes[64];                             /* diagnostic view: lanes not written */
 
@@ -160,6 +176,7 @@ static uint32 sp_lanes[64];                             /* diagnostic view: lane
    what the self-test checks. */
 
 #define SP_DIAG         0x00080000                      /* the diagnostic view */
+#define SP_REGS         0x2000                          /* the registers the command path reaches */
 #define SP_UCADDR       0x212C                          /* microcode address, bits <47:32> */
 #define SP_UCDATA       0x23F8                          /* microcode bits <31:0> */
 #define SP_UCSIZE       1024                            /* microcode words */
@@ -271,6 +288,10 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
    until it takes them.  The other bits of +004
    are set per FIFO by the self-test; their meaning is not known.  Within the FIFO's
    window:
+        00.0000 - 1F.FFFF       scan processor register (a<9:2>) at
+                                2000 + 4r (as Open SIMH's SPX model,
+                                vax4xx_ve.c, has it; the self-test does
+                                not use it)
         20.0000 - 23.FFFF       the TBC's space: its registers, the
                                 Bt459, the FIFO memory (1B0.0000 up;
                                 subtests 12 and 13)
@@ -363,6 +384,10 @@ static uint32 bt_sar_frames = 0;                        /* frames already in it 
 
 t_stat lcspx_reset (DEVICE *dptr);
 t_stat lcspx_svc (UNIT *uptr);
+t_stat lcspx_disp_svc (UNIT *uptr);
+t_stat lcspx_set_monitor (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+t_stat lcspx_screenshot (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+static t_stat lcspx_display (void);
 static void lcspx_wroff (uint32 off, int32 pa, int32 val, int32 lnt);
 static void tbc_advance (void);
 static uint32 tbc_rd (int32 i);
@@ -388,11 +413,18 @@ const char *lcspx_description (DEVICE *dptr);
 #define UNIT_V_MONITOR  (UNIT_V_UF + 0)                 /* a monitor is connected */
 #define UNIT_MONITOR    (1u << UNIT_V_MONITOR)
 
-UNIT lcspx_unit = { UDATA (&lcspx_svc, UNIT_ATTABLE + UNIT_RO, 0) };
+UNIT lcspx_units[] = {
+    { UDATA (&lcspx_svc, UNIT_ATTABLE + UNIT_RO, 0) },  /* option ROM; scan processor done */
+    { UDATA (&lcspx_disp_svc, UNIT_DIS, 0) }            /* display refresh */
+    };
+
+#define lcspx_unit      lcspx_units[0]
+#define lcspx_disp      lcspx_units[1]
 
 MTAB lcspx_mod[] = {
-    { UNIT_MONITOR, UNIT_MONITOR, "monitor", "MONITOR", NULL, NULL, NULL, "A monitor is connected" },
-    { UNIT_MONITOR, 0, "no monitor", "NOMONITOR", NULL, NULL, NULL, "No monitor is connected (the default, as on the author's 4000/90)" },
+    { UNIT_MONITOR, UNIT_MONITOR, "monitor", "MONITOR", &lcspx_set_monitor, NULL, NULL, "A monitor is connected (a window, with video)" },
+    { UNIT_MONITOR, 0, "no monitor", "NOMONITOR", &lcspx_set_monitor, NULL, NULL, "No monitor is connected (the default, as on the author's 4000/90)" },
+    { MTAB_XTD|MTAB_VDV|MTAB_NC, 0, NULL, "SCREENSHOT", &lcspx_screenshot, NULL, NULL, "Write the picture to a PNG file: SCREENSHOT=file" },
     { 0 }
     };
 
@@ -401,6 +433,7 @@ REG lcspx_reg[] = {
     { HRDATAD (BTADDR, bt_addr, 12, "Bt459 address register") },
     { BRDATAD (BTREG, bt_reg, 16, 8, 16, "Bt459 registers 200-20F") },
     { BRDATAD (BTCUR, bt_cur, 16, 8, 16, "Bt459 cursor registers 300-30F") },
+    { BRDATAD (BTCMAP, bt_cmap, 16, 8, 768, "Bt459 colour map, red green blue") },
     { NULL }
     };
 
@@ -413,8 +446,8 @@ DEBTAB lcspx_debug[] = {
     };
 
 DEVICE lcspx_dev = {
-    "LCSPX", &lcspx_unit, lcspx_reg, lcspx_mod,
-    1, 16, 32, 4, 16, 32,
+    "LCSPX", lcspx_units, lcspx_reg, lcspx_mod,
+    2, 16, 32, 4, 16, 32,
     NULL, NULL, &lcspx_reset,
     NULL, &lcspx_attach, &lcspx_detach,
     NULL, DEV_DISABLE | DEV_DEBUG, 0, lcspx_debug, NULL, NULL, &lcspx_help,
@@ -476,6 +509,7 @@ return (ipl < 16.0)? 16.0: ipl;
    53B).  That the count comes from +118 is a guess. */
 
 static void bt_wr (uint32 port, uint32 v);
+static void sp_wr (uint32 o, int32 pa, int32 val, int32 lnt);
 
 static void tbc_lego (void)
 {
@@ -590,6 +624,8 @@ static void cmd_write (uint32 a, uint32 v)
 a = a % LCSPX_CMDSTEP;                                  /* the address within the FIFO's window */
 if ((a - CMD_TBC) < CMD_TBCSIZE)                        /* TBC registers, Bt459, FIFO memory */
     lcspx_wroff (LCSPX_TBC + (a - CMD_TBC), (int32) a, (int32) v, L_LONG);
+else if (((a >> 20) & 3) < 2)                           /* scan processor register */
+    sp_wr (SP_REGS + (a & 0x3FC), (int32) a, (int32) v, L_LONG);
 else sim_debug (DBG_REG, &lcspx_dev, "command to %06X = %08X not modelled\n", a, v);
 }
 
@@ -912,6 +948,7 @@ static void bt_wr (uint32 port, uint32 v)
 {
 uint8 *t;
 
+lcspx_dirty = TRUE;                                     /* colours, cursor may change */
 switch (port) {
 
     case 0:                                             /* address <7:0> */
@@ -1306,6 +1343,7 @@ uint32 per = 4 >> depth, k, bits = 8 << depth;
 
 if (sp_in_left <= 0)
     return FALSE;
+lcspx_dirty = TRUE;
 for (k = 0; (k < per) && (sp_in_left > 0); k++, sp_in_left--) {
     fb_putpix (base + sp_in_x + sp_in_y * stride, depth,
         (bits == 32)? v: ((v >> (k * bits)) & ((1u << bits) - 1)));
@@ -1383,6 +1421,7 @@ switch (mpc & 0xFFFF) {
         }
 sim_cancel (&lcspx_unit);
 sim_activate (&lcspx_unit, SP_DONE_MIN + n / SP_PIX_PER_INSTR);
+lcspx_dirty = TRUE;
 }
 
 /* The scan processor has finished */
@@ -1551,6 +1590,7 @@ if (off < LCSPX_FBSIZE) {                               /* frame buffer */
     lcspx_fb[off + 1] = (nv >> 8) & 0xFF;
     lcspx_fb[off + 2] = (nv >> 16) & 0xFF;
     lcspx_fb[off + 3] = (nv >> 24) & 0xFF;
+    lcspx_dirty = TRUE;
     return;
     }
 if (((off - LCSPX_CMD) < (FIFO_N * LCSPX_CMDSTEP)) &&   /* a FIFO's command window */
@@ -1623,7 +1663,190 @@ for (i = 0; i < FIFO_N; i++)
 sp_in_left = 0;
 memset (lcspx_fifotag, 0, sizeof (lcspx_fifotag));
 bt_addr = bt_m3 = 0;
+lcspx_dirty = TRUE;
+return lcspx_display ();
+}
+
+/* The display
+
+   The picture is the frame buffer's active area (TBC +10C and VBS give
+   its size; 1280 x 1024 at 72 Hz as the console sets it up), each pixel
+   through the Bt459's pixel read mask and colour map, with the Bt459's
+   64 x 64 cursor over it when cursor command <7:6> enable it.  The
+   cursor RAM holds 2 bits per pixel, the leftmost in <7:6> of each byte;
+   1-3 select the cursor colours.  The cursor position registers count
+   from 360 left and 37 above the first visible pixel (NetBSD's spx
+   driver's biases).  With the timing stopped the screen is black. */
+
+#define LCSPX_XSIZE     1280                            /* the window */
+#define LCSPX_YSIZE     1024
+#define LCSPX_REFRESH   20000                           /* usec between refreshes */
+
+static t_bool lcspx_vid = FALSE;                        /* the window is open */
+static uint32 *lcspx_pic = NULL;                        /* the picture, for the window */
+
+typedef void (*LCSPX_PUT) (uint32 x, uint32 y, uint8 r, uint8 g, uint8 b, void *ctx);
+
+static void lcspx_render (LCSPX_PUT put, void *ctx)
+{
+uint32 w = ((lcspx_tbc[0x10C >> 2] & 0x1FF) + 1) * 4;
+uint32 h = (lcspx_tbc[TBC_VBLANK] & TBC_VMASK) + 1;
+t_bool on = (lcspx_tbc[TBC_TCSR] & TCSR_RUN)? TRUE: FALSE;
+uint32 prm = bt_reg[BT_PRM - 0x200];
+t_bool cur = ((bt_cur[0] & 0xC0) != 0);
+int32 cx = (int32) (bt_cur[1] | ((bt_cur[2] & 0xF) << 8)) - 360;
+int32 cy = (int32) (bt_cur[3] | ((bt_cur[4] & 0xF) << 8)) - 37;
+uint32 x, y, c;
+int32 dx, dy;
+uint8 *rgb;
+
+for (y = 0; y < LCSPX_YSIZE; y++) {
+    for (x = 0; x < LCSPX_XSIZE; x++) {
+        if (!on || (x >= w) || (y >= h)) {
+            put (x, y, 0, 0, 0, ctx);
+            continue;
+            }
+        rgb = bt_cmap[lcspx_fb[(y * w + x) & (LCSPX_FBSIZE - 1)] & prm];
+        dx = (int32) x - cx;
+        dy = (int32) y - cy;
+        if (cur && (dx >= 0) && (dx < 64) && (dy >= 0) && (dy < 64)) {
+            c = (bt_curram[dy * 16 + (dx >> 2)] >> (6 - 2 * (dx & 3))) & 3;
+            if (c)
+                rgb = bt_curcol[c - 1];
+            }
+        put (x, y, rgb[0], rgb[1], rgb[2], ctx);
+        }
+    }
+}
+
+static void lcspx_put_window (uint32 x, uint32 y, uint8 r, uint8 g, uint8 b, void *ctx)
+{
+lcspx_pic[y * LCSPX_XSIZE + x] = vid_map_rgb (r, g, b);
+}
+
+/* Open or close the window to follow the MONITOR setting */
+
+static t_stat lcspx_display (void)
+{
+t_stat r;
+
+if ((lcspx_unit.flags & UNIT_MONITOR) && !(lcspx_dev.flags & DEV_DIS)) {
+    if (!lcspx_vid && !vid_active) {
+        r = vid_open (&lcspx_dev, "LCSPX", LCSPX_XSIZE, LCSPX_YSIZE, 0);
+        if (r == SCPE_OK) {
+            lcspx_pic = (uint32 *) calloc (LCSPX_XSIZE * LCSPX_YSIZE, sizeof (uint32));
+            if (lcspx_pic == NULL) {
+                vid_close ();
+                return SCPE_MEM;
+                }
+            lcspx_vid = TRUE;
+            lcspx_dirty = TRUE;
+            }
+        else sim_messagef (SCPE_OK, "%s: no window (%s); SET %s SCREENSHOT=file still works\n",
+            sim_dname (&lcspx_dev), sim_error_text (r), sim_dname (&lcspx_dev));
+        }
+    if (lcspx_vid)
+        sim_activate_after (&lcspx_disp, LCSPX_REFRESH);
+    }
+else if (lcspx_vid) {
+    sim_cancel (&lcspx_disp);
+    free (lcspx_pic);
+    lcspx_pic = NULL;
+    lcspx_vid = FALSE;
+    return vid_close ();
+    }
 return SCPE_OK;
+}
+
+t_stat lcspx_set_monitor (UNIT *uptr, int32 val, CONST char *cptr, void *desc)
+{
+lcspx_unit.flags = (lcspx_unit.flags & ~UNIT_MONITOR) | val;
+return lcspx_display ();
+}
+
+/* Refresh the window, and pass the keyboard and mouse on */
+
+t_stat lcspx_disp_svc (UNIT *uptr)
+{
+SIM_KEY_EVENT kev;
+SIM_MOUSE_EVENT mev;
+
+if (!lcspx_vid)
+    return SCPE_OK;
+if (vid_poll_kb (&kev) == SCPE_OK)
+    lk_event (&kev);
+if (vid_poll_mouse (&mev) == SCPE_OK)
+    vs_event (&mev);
+if (lcspx_dirty) {
+    lcspx_dirty = FALSE;
+    lcspx_render (&lcspx_put_window, NULL);
+    vid_draw (0, 0, LCSPX_XSIZE, LCSPX_YSIZE, lcspx_pic);
+    vid_refresh ();
+    }
+sim_activate_after (uptr, LCSPX_REFRESH);
+return SCPE_OK;
+}
+
+/* SET LCSPX SCREENSHOT=file: the picture as a PNG file */
+
+#if defined (HAVE_LIBPNG)
+static void lcspx_put_png (uint32 x, uint32 y, uint8 r, uint8 g, uint8 b, void *ctx)
+{
+uint8 *row = ((uint8 **) ctx)[y];
+
+row[3 * x] = r;
+row[3 * x + 1] = g;
+row[3 * x + 2] = b;
+}
+#endif
+
+t_stat lcspx_screenshot (UNIT *uptr, int32 val, CONST char *cptr, void *desc)
+{
+#if defined (HAVE_LIBPNG)
+FILE *f;
+png_structp png;
+png_infop info;
+uint8 *pix, **rows;
+uint32 y;
+t_stat r = SCPE_OK;
+
+if ((cptr == NULL) || (*cptr == 0))
+    return sim_messagef (SCPE_ARG, "SCREENSHOT needs a file name\n");
+pix = (uint8 *) malloc (LCSPX_XSIZE * LCSPX_YSIZE * 3);
+rows = (uint8 **) malloc (LCSPX_YSIZE * sizeof (uint8 *));
+if ((pix == NULL) || (rows == NULL)) {
+    free (pix);
+    free (rows);
+    return SCPE_MEM;
+    }
+for (y = 0; y < LCSPX_YSIZE; y++)
+    rows[y] = pix + y * LCSPX_XSIZE * 3;
+lcspx_render (&lcspx_put_png, rows);
+f = sim_fopen (cptr, "wb");
+if (f == NULL)
+    r = sim_messagef (SCPE_OPENERR, "%s: cannot create %s\n", sim_dname (&lcspx_dev), cptr);
+else {
+    png = png_create_write_struct (PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    info = (png == NULL)? NULL: png_create_info_struct (png);
+    if ((info == NULL) || setjmp (png_jmpbuf (png)))
+        r = SCPE_IOERR;
+    else {
+        png_init_io (png, f);
+        png_set_IHDR (png, info, LCSPX_XSIZE, LCSPX_YSIZE, 8, PNG_COLOR_TYPE_RGB,
+            PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+        png_write_info (png, info);
+        png_write_image (png, rows);
+        png_write_end (png, NULL);
+        }
+    png_destroy_write_struct (&png, &info);
+    fclose (f);
+    }
+free (rows);
+free (pix);
+return r;
+#else
+return sim_messagef (SCPE_NOFNC, "%s: this simulator was built without PNG support\n", sim_dname (&lcspx_dev));
+#endif
 }
 
 /* Attach the option ROM file
