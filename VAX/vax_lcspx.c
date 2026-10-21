@@ -287,6 +287,8 @@ static uint32 lcspx_tbc[LCSPX_TBCSIZE >> 2];            /* TBC registers */
 
 #define TCSR_REQ        0x00000007                      /* requests done at VBF */
 #define TCSR_REQEN      0x00000008                      /* ... while this is set */
+#define TCSR_LEGO        0x00000003                     /* request: play the LEGO table */
+#define TBC_LEGOTAB     (0x118 >> 2)                    /* LEGO table: <10:0> entries, <23:16> offset */
 #define TCSR_RUN        0x00000020                      /* timing runs */
 #define TCSR_V0         0x00020000                      /* line counter <0> */
 #define TCSR_VS         0x00040000                      /* in vertical sync */
@@ -383,7 +385,16 @@ const char *lcspx_description (DEVICE *dptr);
    lcspx_reg    LCSPX register list
 */
 
+#define UNIT_V_MONITOR  (UNIT_V_UF + 0)                 /* a monitor is connected */
+#define UNIT_MONITOR    (1u << UNIT_V_MONITOR)
+
 UNIT lcspx_unit = { UDATA (&lcspx_svc, UNIT_ATTABLE + UNIT_RO, 0) };
+
+MTAB lcspx_mod[] = {
+    { UNIT_MONITOR, UNIT_MONITOR, "monitor", "MONITOR", NULL, NULL, NULL, "A monitor is connected" },
+    { UNIT_MONITOR, 0, "no monitor", "NOMONITOR", NULL, NULL, NULL, "No monitor is connected (the default, as on the author's 4000/90)" },
+    { 0 }
+    };
 
 REG lcspx_reg[] = {
     { BRDATAD (TBC,   lcspx_tbc, 16, 32, LCSPX_TBCSIZE >> 2, "TBC registers") },
@@ -402,7 +413,7 @@ DEBTAB lcspx_debug[] = {
     };
 
 DEVICE lcspx_dev = {
-    "LCSPX", &lcspx_unit, lcspx_reg, NULL,
+    "LCSPX", &lcspx_unit, lcspx_reg, lcspx_mod,
     1, 16, 32, 4, 16, 32,
     NULL, NULL, &lcspx_reset,
     NULL, &lcspx_attach, &lcspx_detach,
@@ -453,13 +464,45 @@ double ipl = sim_timer_inst_per_sec () * TBC_LINE_USEC / 1000000.0;
 return (ipl < 16.0)? 16.0: ipl;
 }
 
+/* The LEGO table (subtest 31): at vertical blank finish, on request
+   (timing CSR <1:0>), the TBC plays a table of Bt459 bus cycles kept in
+   the frame buffer, so that software can change the colour map, cursor
+   and registers without disturbing the picture.  Each entry is 16 bits,
+   one bit per pixel (bit 0 of 16 consecutive pixels, least significant
+   first); <9:8> is the Bt459 port (0 address low, 1 address high, 2
+   register, 3 colour map) and <7:0> the data.  The self-test writes the
+   table at the first row below the active display, offset by +118<23:16>
+   pixels; the model plays +118<10:0> entries from there (the console sets
+   53B).  That the count comes from +118 is a guess. */
+
+static void bt_wr (uint32 port, uint32 v);
+
+static void tbc_lego (void)
+{
+uint32 w = ((lcspx_tbc[0x10C >> 2] & 0x1FF) + 1) * 4;
+uint32 h = (lcspx_tbc[TBC_VBLANK] & TBC_VMASK) + 1;
+uint32 p = h * w + ((lcspx_tbc[TBC_LEGOTAB] >> 16) & 0xFF);
+uint32 n = lcspx_tbc[TBC_LEGOTAB] & 0x7FF;
+uint32 i, b, e;
+
+sim_debug (DBG_REG, &lcspx_dev, "LEGO table at pixel %06X, %d entries\n", p, n);
+for (i = 0; i < n; i++) {
+    for (b = 0, e = 0; b < 16; b++, p++)
+        e = e | ((lcspx_fb[p & (LCSPX_FBSIZE - 1)] & 1) << b);
+    bt_wr ((e >> 8) & 3, e & 0xFF);
+    }
+}
+
 /* At vertical blank finish the TBC carries out the requests in the
    timing CSR */
 
 static void tbc_vbf_reqs (void)
 {
-if (lcspx_tbc[TBC_TCSR] & TCSR_REQEN)
+if (lcspx_tbc[TBC_TCSR] & TCSR_REQEN) {
+    if (lcspx_tbc[TBC_TCSR] & TCSR_LEGO)
+        tbc_lego ();
     lcspx_tbc[TBC_TCSR] &= ~TCSR_REQ;
+    }
 }
 
 /* Bring the line counter up to the present, latching the vertical blank
@@ -733,6 +776,61 @@ if (lcspx_tbc[TBC_TCSR] & TCSR_RUN) {
 bt_sar_frames = tbc_frames;
 }
 
+/* Bt459 analog comparator (subtest 32)
+
+   Test register <7:4> select two of the analog outputs (red <7> or
+   green <6> against blue <5> or a 145 mV reference <4>); <3> reads one
+   while the first is the higher.  The chip compares the outputs at the
+   left edge of the cursor; the model takes the colour of the pixel
+   there.  An output's level, in IRE units, is 7.5 (the pedestal, command
+   register 2 <6>) plus 92.5 x code / 255, and green carries 40 more for
+   the sync it carries (<7>).  The voltage per IRE unit depends on the
+   load: the option ROM's subtest 32 first compares red at code 10
+   with the reference and takes the smaller of two sets of test levels
+   when red is above it.  The model uses 7.14 mV per IRE unit with a
+   monitor (the RS-343 level into the monitor's 75 ohms and the board's)
+   and twice that without one (no far-end termination).  Then the real
+   machines' results follow: with a monitor (the 4000/96) every check
+   passes; without one (the 4000/90) red 10 is above the reference, the
+   smaller set leaves green with its sync above blue where the test wants
+   it below, and the test fails at its error 6 with both readings 68. */
+
+#define BT_CMD2         0x203
+#define BT_REF_MV       145.0
+#define BT_MV_IRE       7.14
+
+static double bt_level (uint32 code, t_bool green)
+{
+double ire = 92.5 * (double) code / 255.0;
+
+if (bt_reg[BT_CMD2 - 0x200] & 0x40)                     /* pedestal */
+    ire = ire + 7.5;
+if (green && (bt_reg[BT_CMD2 - 0x200] & 0x80))          /* sync on green */
+    ire = ire + 40.0;
+return ire * BT_MV_IRE * ((lcspx_unit.flags & UNIT_MONITOR)? 1.0: 2.0);
+}
+
+static uint32 bt_compare (void)
+{
+uint32 t = bt_reg[BT_TEST - 0x200];
+int32 cx = (bt_cur[1] | (bt_cur[2] << 8)) - 360 - 1;    /* NetBSD's cursor bias: 360, 37 */
+int32 cy = (bt_cur[3] | (bt_cur[4] << 8)) - 37;
+uint32 w = ((lcspx_tbc[0x10C >> 2] & 0x1FF) + 1) * 4;
+uint8 *rgb;
+double a, b;
+
+if (cx < 0)
+    cx = 0;
+if (cy < 0)
+    cy = 0;
+rgb = bt_cmap[lcspx_fb[(cy * w + cx) & (LCSPX_FBSIZE - 1)] & bt_reg[BT_PRM - 0x200]];
+a = (t & 0x80)? bt_level (rgb[0], FALSE): bt_level (rgb[1], TRUE);
+b = (t & 0x20)? bt_level (rgb[2], FALSE): BT_REF_MV;
+sim_debug (DBG_REG, &lcspx_dev, "Bt459 compare test %02X colour %02X %02X %02X: %.0f mV against %.0f mV\n",
+    t, rgb[0], rgb[1], rgb[2], a, b);
+return ((t & 0xF0) && (a > b))? 0x08: 0;
+}
+
 /* Bt459: the colour triple at an address, or NULL for a single register */
 
 static uint8 *bt_triple (uint32 a, t_bool cmap)
@@ -801,6 +899,8 @@ switch (port) {
             bt_sar_update ();
             v = (bt_sar >> ((bt_addr - BT_SAR) * 8)) & 0xFF;
             }
+        else if (bt_addr == BT_TEST)                    /* with the comparator's result */
+            v = (bt_reg[BT_TEST - 0x200] & ~0x08) | bt_compare ();
         else v = *bt_single (bt_addr);
         bt_step (FALSE);
         return v;
@@ -1599,7 +1699,10 @@ fprintf (st, "   sim> ATTACH LCSPX <file>\n\n");
 fprintf (st, "The file is either the ROM as the CPU reads it (262144 bytes, one longword\n");
 fprintf (st, "C000xxxx per 16-bit word) or the logical ROM (131072 bytes).  Without it\n");
 fprintf (st, "the ROM reads as zero and the console reports the graphics as UNK.\n\n");
-fprintf (st, "SET LCSPX DISABLED removes the option altogether.\n");
+fprintf (st, "SET LCSPX MONITOR says that a monitor is connected; NOMONITOR, the\n");
+fprintf (st, "default, that none is, as on the author's VAXstation 4000/90: the console\n");
+fprintf (st, "then reports the graphics as \"?? 001 0512\" (its Bt459 analog compare test\n");
+fprintf (st, "needs a monitor).  SET LCSPX DISABLED removes the option altogether.\n");
 fprint_set_help (st, dptr);
 fprint_show_help (st, dptr);
 fprint_reg_help (st, dptr);
