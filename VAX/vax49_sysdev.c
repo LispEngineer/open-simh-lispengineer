@@ -48,13 +48,34 @@
 #include "vax_sgec.h"
 #include "vax_lcspx.h"
 
-#ifdef DONT_USE_INTERNAL_ROM
-#define BOOT_CODE_FILENAME "ka49a.bin"
-#else /* !DONT_USE_INTERNAL_ROM */
+/* The console ROM.  The simulator carries DEC's KA49 console firmware
+   built in when the tree has it: VAX/ka49a.bin listed in sim_BuildROMs.c,
+   which writes vax_ka49a_bin.h from it.  A tree without that header (or a
+   build with DONT_USE_INTERNAL_ROM) loads the ROM at run time instead:
+   LOAD -R <file> before BOOT, or, at the first BOOT, the file ka49a.bin
+   in the current working directory.  The image is public (see
+   ka49_rom_missing below for where to get it). */
+
+#if !defined (DONT_USE_INTERNAL_ROM) && defined (__has_include)
+#if __has_include ("vax_ka49a_bin.h")
+#define KA49_INTERNAL_ROM       1
+#endif
+#endif
+
+#if defined (KA49_INTERNAL_ROM)
 #include "vax_ka49a_bin.h" /* Defines BOOT_CODE_FILENAME and BOOT_CODE_ARRAY, etc */
-#endif /* DONT_USE_INTERNAL_ROM */
+#else
+#define BOOT_CODE_FILENAME "ka49a.bin"
+#if !defined (BOOT_CODE_ARRAY)
+#define BOOT_CODE_ARRAY NULL
+#define BOOT_CODE_SIZE 0
+#endif
+#endif
 
 t_stat vax49_boot (int32 flag, CONST char *ptr);
+#if !defined (KA49_INTERNAL_ROM)
+static void ka49_rom_missing (void);
+#endif
 
 /* Special boot command, overrides regular boot */
 
@@ -1767,11 +1788,37 @@ if (rom == NULL)
     return SCPE_IERR;
 if (*rom == 0) {                                        /* no boot? */
     r = cpu_load_bootcode (BOOT_CODE_FILENAME, BOOT_CODE_ARRAY, BOOT_CODE_SIZE, TRUE, 0);
-    if (r != SCPE_OK)
+    if (r != SCPE_OK) {
+#if !defined (KA49_INTERNAL_ROM)
+        ka49_rom_missing ();
+#endif
         return r;
+        }
     }
 return SCPE_OK;
 }
+
+#if !defined (KA49_INTERNAL_ROM)
+/* No console ROM built in, none loaded, and no ka49a.bin to load: say what
+   is needed and where it is published.  Any KA49-A image runs (V1.0-006,
+   V1.3-0BC and V1.4-0D0 pass the power-up tests); V1.4 is the one that
+   real machines ship with after DEC's last update. */
+
+static void ka49_rom_missing (void)
+{
+sim_printf ("\n");
+sim_printf ("The KA49 console ROM is not built into this simulator and none is loaded.\n");
+sim_printf ("Load it before BOOT with LOAD -R <file>, or put it in the current working\n");
+sim_printf ("directory as %s.  It is DEC's KA49-A console firmware, %u bytes;\n", BOOT_CODE_FILENAME, (uint32) ROMSIZE);
+sim_printf ("the V1.4-0D0-V4.4 image has the sim_BuildROMs checksum 0xFD87B044 and the\n");
+sim_printf ("sha256 47487fb808d85e426da6298299fc2014c0dd1638199716b31f80d4173f2f8b11.\n");
+sim_printf ("It is published in the Oxide VAX PROM archive,\n");
+sim_printf ("   http://www.oxide.org/vaxproms/KA49-A_V1.4-0D0-V4.4.bin.gz\n");
+sim_printf ("and is the last %u bytes of cougar.sys in DEC's V1.4 firmware update kit\n", (uint32) ROMSIZE);
+sim_printf ("(the same archive's cougar_fw.zip, or Cougar/v1.4 in the DECROMs collection,\n");
+sim_printf ("   https://github.com/larsbrinkhoff/DECROMs).\n\n");
+}
+#endif
 
 /* SYSD reset */
 
