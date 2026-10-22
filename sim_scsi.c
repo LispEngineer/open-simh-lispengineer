@@ -393,6 +393,22 @@ switch (st) {
 return;
 }
 
+/* Translate sim_tape status to SCSI status for a read or a write of the medium
+
+   An I/O error on the container is the medium failing to be read or written,
+   which a drive reports as MEDIUM ERROR with the additional sense code of the
+   operation (SCSI-2 8.2.14.3), not as a failure of the drive. Every other
+   status, including the ones scsi_tape_status() has no case for, keeps its
+   own translation. */
+
+void scsi_tape_io_status (SCSI_BUS *bus, t_stat st, uint32 asc)
+{
+scsi_tape_status (bus, st);
+if (st == MTSE_IOERR)
+    scsi_status_deferred (bus, STS_CHK, KEY_MEDERR, asc);
+return;
+}
+
 /* Limit the transfer count to the allocation specified
    by the SCSI command */
 
@@ -906,7 +922,7 @@ if (uptr->flags & UNIT_ATT) {
                 if (r == MTSE_OK) {
                     new_buf_b += SCSI_QIC_BLKSZ;
                 } else {
-                    scsi_tape_status(bus, r);
+                    scsi_tape_io_status (bus, r, ASC_UNRERR);
                     scsi_status(bus, bus->status, bus->sense_key, bus->sense_code);
                     return;
                 }
@@ -967,7 +983,7 @@ if (uptr->flags & UNIT_ATT) {
     if (r != MTSE_OK) {
         scsi_debug_cmd (bus, "Read error, r = %d\n", r);
         }
-        scsi_tape_status (bus, r);
+        scsi_tape_io_status (bus, r, ASC_UNRERR);
     if (resid != 0) {                                   /* underlength: the record was read, */
         scsi_status_deferred (bus, STS_CHK, (KEY_OK | KEY_M_ILI), ASC_OK);  /* but the length was wrong */
         bus->sense_info = resid;
@@ -1221,7 +1237,7 @@ else if (bus->phase == SCSI_DATO) {
 
     r = sim_tape_wrrecf (uptr, &bus->buf[0], sects);
     scsi_debug_cmd (bus, "Write(6) - DATO, r = %d\n", r);
-    scsi_tape_status (bus, r);                          /* translate status */
+    scsi_tape_io_status (bus, r, ASC_WRTERR);           /* translate status */
 
     memset (&bus->cmd[0], 0, 10);                       /* clear current cmd */
     scsi_status (bus, bus->status, bus->sense_key, bus->sense_code);
