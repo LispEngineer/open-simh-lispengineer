@@ -49,12 +49,12 @@ Build it exactly as Open SIMH, for example:
 | VAX 4xx: the NI interrupt request is latched on the LANCE line's rising edge, as these boards' interrupt controllers do; STOP clears the rest of CSR0 | `VAX/vax_xs.c`, four VAX 4xx `_defs.h` files | #626 (on #587) |
 | LANCE (XS): internal loopback carries the CRC, and a frame under 60 bytes is not reported as a buffer error | `VAX/vax_xs.c`, `sim_ether.h` | #627 |
 | LANCE (XS): external loopback hands a sent frame back to the receiver (with the four above, the KA46 power-on NI test passes) | `VAX/vax_xs.c`, `sim_ether.h` | #628 |
-| LANCE (XS): a transmit frame over 1518 bytes is CSR0<BABL> and is not sent (it was sent truncated and reported as TMD3<BUFF>) | `VAX/vax_xs.c` | prepared, not yet offered |
-| LANCE (XS): the transmit descriptor's status words are written whole, not ORed into what the guest left there | `VAX/vax_xs.c` | prepared, not yet offered |
-| LANCE (XS): received multicast is filtered with the guest's logical address filter (all multicast was accepted once any filter bit was set; a zero filter dropped broadcast) | `VAX/vax_xs.c` | prepared, not yet offered |
-| SCSI: REASSIGN BLOCKS for disks (it was an unknown command) | `sim_scsi.c` | prepared, not yet offered (on #590) |
-| SCSI tape: transfers stay inside the bus buffer; I/O status and sense reported, a failed read is no data, an underlength record reports ILI and its residue | `sim_scsi.c` | prepared, not yet offered (on #590) |
-| SCSI: a failed host read or write is MEDIUM ERROR, not HARDWARE ERROR (OpenVMS retried 22 times and ran mount verification; now three retries and a read error) | `sim_scsi.c` | prepared, not yet offered (on #589) |
+| LANCE (XS): a transmit frame over 1518 bytes is CSR0<BABL> and is not sent (it was sent truncated and reported as TMD3<BUFF>) | `VAX/vax_xs.c` | #640 |
+| LANCE (XS): the transmit descriptor's status words are written whole, not ORed into what the guest left there | `VAX/vax_xs.c` | #641 |
+| LANCE (XS): received multicast is filtered with the guest's logical address filter (all multicast was accepted once any filter bit was set; a zero filter dropped broadcast) | `VAX/vax_xs.c` | #642 |
+| SCSI: REASSIGN BLOCKS for disks (it was an unknown command) | `sim_scsi.c` | #638 (on #590) |
+| SCSI tape: transfers stay inside the bus buffer; I/O status and sense reported, a failed read is no data, an underlength record reports ILI and its residue | `sim_scsi.c` | #639 (on #590) |
+| SCSI: a failed host read or write is MEDIUM ERROR, not HARDWARE ERROR (OpenVMS retried 22 times and ran mount verification; now three retries and a read error) | `sim_scsi.c` | #637 (on #589) |
 
 ## Behaviour that differs from Open SIMH
 
