@@ -841,6 +841,8 @@ t_seccnt sects, sectsread, new_buf_b;
 t_uint64 want;
 t_stat r;
 uint32 i, resid = 0;
+t_seccnt reclen;
+uint8 *rbuf;
 
 if ((data[1] & 0x3) == 0x3) {                           /* SILI and FIXED? */
     scsi_status (bus, STS_CHK, KEY_ILLREQ, ASC_INVCDB);
@@ -912,6 +914,31 @@ if (uptr->flags & UNIT_ATT) {
                     r = sim_tape_rdrecf (uptr, &bus->buf[0], &sectsread, sectsread);
                     if (sectsread > sects)                  /* the part that was asked for */
                         sectsread = sects;
+                    }
+                else if ((sects <= bus->buf_size) && (sectsread > sects)) { /* longer than the request */
+                    /* SCSI-2 10.2.4: the requested bytes are transferred, the rest of
+                       the block is truncated and the tape is left after the block;
+                       the information field is the request less the block (negative) */
+                    reclen = sectsread;
+                    rbuf = &bus->buf[0];
+                    if (reclen > bus->buf_size) {           /* the whole block will not fit the buffer */
+                        rbuf = (uint8 *)malloc (reclen);
+                        if (rbuf == NULL) {
+                            scsi_status (bus, STS_CHK, KEY_HWERR, ASC_OK);
+                            return;                         /* sim_tape read nothing */
+                            }
+                        }
+                    scsi_debug_cmd (bus, "Overlength - truncated to %d of %d bytes, check condition\n", sects, reclen);
+                    r = sim_tape_rdrecf (uptr, rbuf, &sectsread, reclen);
+                    if ((r == MTSE_OK) || (r == MTSE_RECE)) {
+                        if (rbuf != &bus->buf[0])
+                            memcpy (&bus->buf[0], rbuf, sects);
+                        sectsread = sects;                  /* what the initiator is given */
+                        if (r == MTSE_OK)
+                            resid = (sects - reclen);       /* reported after the status below */
+                        }
+                    if (rbuf != &bus->buf[0])
+                        free (rbuf);
                     }
                 else {
                     scsi_debug_cmd (bus, "Overlength - check condition\n");
