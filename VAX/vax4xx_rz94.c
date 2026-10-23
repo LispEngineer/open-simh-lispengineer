@@ -163,6 +163,7 @@ t_stat rz_attach (UNIT *uptr, CONST char *cptr);
 void rz_sw_reset (CTLR *rz);
 t_stat rz_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *cptr);
 void rz_cmd (CTLR *rz, uint32 cmd);
+void rz_dma_stopped (CTLR *rz, uint32 cmd, int32 nshort);
 t_stat rz_set_type (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
 t_stat rz_show_type (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
 const char *rz_description (DEVICE *dptr);
@@ -519,12 +520,33 @@ rz->intr |= flag;
 sim_activate (&rz_unit[RZ_CTLR], 50);
 }
 
+/* The board's DMA engine moved fewer bytes than the chip asked for
+
+   The chip's transfer counter decrements on a DMA acknowledge for data out
+   and synchronous data in, and on the SCSI ACK for asynchronous data in
+   (so it can run ahead of a stopped engine by the 16 bytes of its FIFO)
+   (NCR 53C94/95/96 data sheet, Transfer Counter register): a board that
+   stops answering, as the KA46's does for a map entry with the valid bit
+   clear, leaves the count short and the command unfinished.  The chip
+   therefore sets no terminal count and raises no interrupt; the command
+   stays where it is until software resets the chip (or the bus), as on
+   the real part.  The board reports the failure to the CPU itself (on the
+   KA46, PAR_CTL<SCSI_MAP> and the SCSI interrupt).  A transfer of 16 bytes
+   or fewer that a real chip would finish into its FIFO stops here too. */
+
+void rz_dma_stopped (CTLR *rz, uint32 cmd, int32 nshort)
+{
+sim_debug (DBG_CMD, &rz_dev, "DMA stopped, %d bytes not moved\n", nshort);
+rz->last_cmd = cmd;
+}
+
 void rz_cmd (CTLR *rz, uint32 cmd)
 {
 uint32 ini = (rz->cfg1 & CFG1_MYID);
 uint32 tgt = rz->dest;
 uint32 state = scsi_state (&rz->bus, ini);
 uint32 txc, i, old_phase;
+int32 nshort;
 UNIT *cuptr = &rz_unit[RZ_CTLR];
 
 if ((cmd & CMD_DISC) && (state != SCSI_DISC)) {         /* check cmd validity */
@@ -754,10 +776,15 @@ switch (cmd & 0x7f) {
                 if (rz->bus.phase == 6)
                     scsi_release_atn (&rz->bus);
                 if (cmd & 0x80) {                       /* DMA */
-                    RZ_DMA_READ (rz, rz->txc, &rz->buf[0]);
-                    txc = scsi_write (&rz->bus, &rz->buf[0], rz->txc);
+                    nshort = RZ_DMA_READ (rz, rz->txc, &rz->buf[0]);
+                    txc = ((uint32) nshort < rz->txc)?
+                        scsi_write (&rz->bus, &rz->buf[0], rz->txc - nshort): 0;
                     RZ_DMA_DONE (rz, txc);
                     rz->txc -= txc;
+                    if (nshort != 0) {                  /* board stopped the DMA */
+                        rz_dma_stopped (rz, cmd, nshort);
+                        return;
+                        }
                     if (rz->txc == 0)
                         rz->stat |= STS_TC;
                     }
@@ -774,9 +801,13 @@ switch (cmd & 0x7f) {
                 if (cmd & 0x80) {                       /* DMA */
                     while ((rz->bus.phase == old_phase) && (rz->txc != 0)) {
                         txc = scsi_read (&rz->bus, &rz->buf[0], rz->txc);
-                        RZ_DMA_WRITE (rz, txc, &rz->buf[0]);
-                        RZ_DMA_DONE (rz, txc);
-                        rz->txc -= txc;
+                        nshort = RZ_DMA_WRITE (rz, txc, &rz->buf[0]);
+                        RZ_DMA_DONE (rz, txc - nshort);
+                        rz->txc -= txc - nshort;
+                        if (nshort != 0) {              /* board stopped the DMA */
+                            rz_dma_stopped (rz, cmd, nshort);
+                            return;
+                            }
                         }
                     if (rz->txc == 0)
                         rz->stat |= STS_TC;
