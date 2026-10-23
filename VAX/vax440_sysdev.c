@@ -255,9 +255,10 @@ return 0;
 
 /* Map an address via the translation map
 
-   An entry with the valid bit clear, met by the NI's DMA, sets PAR_CTL<NI_MAP>,
-   and the setting of that bit requests an NI interrupt. The SCSI engine's
-   (PAR_CTL<SCSI_MAP>) is not reported. */
+   An entry with the valid bit clear sets the map error bit of the engine
+   that met it, PAR_CTL<NI_MAP> or PAR_CTL<SCSI_MAP>, and the setting of that
+   bit requests that engine's own interrupt, NI or SCSI (specification 7.5).
+   The caller gets the bytes not moved from the Map_ routines below. */
 
 t_bool dma_map_addr (uint32 da, uint32 *ma, int32 dma)
 {
@@ -272,6 +273,10 @@ if (dblk <= DMANMAPR) {
     else if ((dma == DMA_NI) && !(ka_parctl & PARCTL_NMAP)) {
         ka_parctl |= PARCTL_NMAP;                       /* NI map error */
         SET_INT (XS1);
+        }
+    else if ((dma == DMA_SCSI) && !(ka_parctl & PARCTL_SMAP)) {
+        ka_parctl |= PARCTL_SMAP;                       /* SCSI map error */
+        SET_INT (SC);
         }
     }
 return FALSE;
