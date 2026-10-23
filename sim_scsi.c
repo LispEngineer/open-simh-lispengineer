@@ -56,6 +56,7 @@
 #define CMD_SPACE       0x11                            /* space */
 #define CMD_WRFMARK     0x10                            /* write filemarks */
 #define CMD_REASSIGN    0x07                            /* reassign blocks */
+#define CMD_RDPOS       0x34                            /* read position */
 
 #define CMD_READ6_TAPE_FIXED    0x01                    /* Fixed record size read */
 #define CMD_READ6_TAPE_SILI     0x02                    /* Suppress Incorrect Length Indicator */
@@ -301,6 +302,7 @@ void scsi_status (SCSI_BUS *bus, uint32 sts, uint32 key, uint32 asc)
 {
 bus->sense_key = key;
 bus->sense_code = asc;
+bus->sense_info = 0;                                    /* the information of an earlier status is not this one's */
 bus->buf[0] = sts;                                      /* status code */
 bus->buf_b = 1;
 scsi_set_phase (bus, SCSI_STS);                         /* status phase next */
@@ -314,6 +316,7 @@ void scsi_status_deferred (SCSI_BUS *bus, uint32 sts, uint32 key, uint32 asc)
 bus->status = sts;
 bus->sense_key = key;
 bus->sense_code = asc;
+bus->sense_info = 0;                                    /* a caller that has some sets it after this */
 }
 
 /* Decode the command group to get the command length */
@@ -387,6 +390,22 @@ switch (st) {
         break;
         }
 
+return;
+}
+
+/* Translate sim_tape status to SCSI status for a read or a write of the medium
+
+   An I/O error on the container is the medium failing to be read or written,
+   which a drive reports as MEDIUM ERROR with the additional sense code of the
+   operation (SCSI-2 8.2.14.3), not as a failure of the drive. Every other
+   status, including the ones scsi_tape_status() has no case for, keeps its
+   own translation. */
+
+void scsi_tape_io_status (SCSI_BUS *bus, t_stat st, uint32 asc)
+{
+scsi_tape_status (bus, st);
+if (st == MTSE_IOERR)
+    scsi_status_deferred (bus, STS_CHK, KEY_MEDERR, asc);
 return;
 }
 
@@ -867,6 +886,8 @@ t_seccnt sects, sectsread, new_buf_b;
 t_uint64 want;
 t_stat r;
 uint32 i, resid = 0;
+t_seccnt reclen;
+uint8 *rbuf;
 
 if ((data[1] & 0x3) == 0x3) {                           /* SILI and FIXED? */
     scsi_status (bus, STS_CHK, KEY_ILLREQ, ASC_INVCDB);
@@ -903,7 +924,7 @@ if (uptr->flags & UNIT_ATT) {
                 if (r == MTSE_OK) {
                     new_buf_b += SCSI_QIC_BLKSZ;
                 } else {
-                    scsi_tape_status(bus, r);
+                    scsi_tape_io_status (bus, r, ASC_UNRERR);
                     scsi_status(bus, bus->status, bus->sense_key, bus->sense_code);
                     return;
                 }
@@ -939,6 +960,31 @@ if (uptr->flags & UNIT_ATT) {
                     if (sectsread > sects)                  /* the part that was asked for */
                         sectsread = sects;
                     }
+                else if ((sects <= bus->buf_size) && (sectsread > sects)) { /* longer than the request */
+                    /* SCSI-2 10.2.4: the requested bytes are transferred, the rest of
+                       the block is truncated and the tape is left after the block;
+                       the information field is the request less the block (negative) */
+                    reclen = sectsread;
+                    rbuf = &bus->buf[0];
+                    if (reclen > bus->buf_size) {           /* the whole block will not fit the buffer */
+                        rbuf = (uint8 *)malloc (reclen);
+                        if (rbuf == NULL) {
+                            scsi_status (bus, STS_CHK, KEY_HWERR, ASC_OK);
+                            return;                         /* sim_tape read nothing */
+                            }
+                        }
+                    scsi_debug_cmd (bus, "Overlength - truncated to %d of %d bytes, check condition\n", sects, reclen);
+                    r = sim_tape_rdrecf (uptr, rbuf, &sectsread, reclen);
+                    if ((r == MTSE_OK) || (r == MTSE_RECE)) {
+                        if (rbuf != &bus->buf[0])
+                            memcpy (&bus->buf[0], rbuf, sects);
+                        sectsread = sects;                  /* what the initiator is given */
+                        if (r == MTSE_OK)
+                            resid = (sects - reclen);       /* reported after the status below */
+                        }
+                    if (rbuf != &bus->buf[0])
+                        free (rbuf);
+                    }
                 else {
                     scsi_debug_cmd (bus, "Overlength - check condition\n");
                     scsi_status (bus, STS_CHK, (KEY_OK | KEY_M_ILI), ASC_OK);
@@ -964,7 +1010,7 @@ if (uptr->flags & UNIT_ATT) {
     if (r != MTSE_OK) {
         scsi_debug_cmd (bus, "Read error, r = %d\n", r);
         }
-        scsi_tape_status (bus, r);
+        scsi_tape_io_status (bus, r, ASC_UNRERR);
     if (resid != 0) {                                   /* underlength: the record was read, */
         scsi_status_deferred (bus, STS_CHK, (KEY_OK | KEY_M_ILI), ASC_OK);  /* but the length was wrong */
         bus->sense_info = resid;
@@ -1218,7 +1264,7 @@ else if (bus->phase == SCSI_DATO) {
 
     r = sim_tape_wrrecf (uptr, &bus->buf[0], sects);
     scsi_debug_cmd (bus, "Write(6) - DATO, r = %d\n", r);
-    scsi_tape_status (bus, r);                          /* translate status */
+    scsi_tape_io_status (bus, r, ASC_WRTERR);           /* translate status */
 
     memset (&bus->cmd[0], 0, 10);                       /* clear current cmd */
     scsi_status (bus, bus->status, bus->sense_key, bus->sense_code);
@@ -1367,6 +1413,10 @@ switch (code) {
         else                                            /* forwards */
             r = sim_tape_spfilef (uptr, sects, &skipped);
         break;
+
+    default:                                            /* sequential filemarks, end of data, */
+        scsi_status (bus, STS_CHK, KEY_ILLREQ, ASC_INVCDB); /* setmarks and the reserved codes */
+        return;
         }
 
 scsi_tape_status (bus, r);
@@ -1411,6 +1461,47 @@ bus->buf[bus->buf_b++] = (MTR_MAXLEN >> 8) & 0xFF;      /* max block length (15:
 bus->buf[bus->buf_b++] = MTR_MAXLEN & 0xFF;             /* max block length (7:0) */
 bus->buf[bus->buf_b++] = 0x00;                          /* min block length (15:8) */
 bus->buf[bus->buf_b++] = 0x01;                          /* min block length (7:0) */
+scsi_set_phase (bus, SCSI_DATI);                        /* data in phase next */
+scsi_set_req (bus);                                     /* request to send data */
+}
+
+/* Command - Read Position
+
+   The short form (SCSI-2 10.2.6) is twenty bytes: BOP, EOP and BPU flags, the
+   partition, the first and last block locations, and the blocks and bytes in
+   the target's buffer. A SIMH tape unit keeps a byte offset into its container
+   and no block count, so it cannot give a block address: BPU (block position
+   unknown) is always set and the locations are zero, as the standard allows
+   for a target that does not know where it is. BOP is set at the beginning of
+   the tape, which the unit does know. The unit has no buffer.
+
+   OpenVMS sends this command when it initializes or mounts a tape. Measured
+   with a BACKUP save, restore and compare on a simulated tape: with BPU clear
+   (a position of zero) it asks again at every mount and the drive ends with a
+   device error count of 1; with BPU set it asks once and the count stays 0.
+
+   Only the BT bit of byte 1 is defined in SCSI-2; the other forms of later
+   standards (service actions such as the long form) are refused. */
+
+void scsi_read_position (SCSI_BUS *bus, uint8 *data, uint32 len)
+{
+UNIT *uptr = bus->dev[bus->target];
+
+scsi_debug_cmd (bus, "Read Position\n");
+
+if (data[1] & 0xFE) {                                   /* only BT (bit 0) is defined: no other form */
+    scsi_status (bus, STS_CHK, KEY_ILLREQ, ASC_INVCDB);
+    return;
+    }
+
+if ((uptr->flags & UNIT_ATT) == 0) {                    /* no tape loaded */
+    scsi_status (bus, STS_CHK, KEY_NOTRDY, ASC_NOMEDIA);
+    return;
+    }
+
+memset (&bus->buf[bus->buf_b], 0, 20);
+bus->buf[bus->buf_b] = sim_tape_bot (uptr) ? 0x84 : 0x04; /* BOP at the beginning of the tape, BPU always */
+bus->buf_b += 20;
 scsi_set_phase (bus, SCSI_DATI);                        /* data in phase next */
 scsi_set_req (bus);                                     /* request to send data */
 }
@@ -1680,6 +1771,10 @@ switch (data[0]) {
 
     case CMD_RDBLKLIM:                                  /* mandatory */
         scsi_read_blklim (bus, data, len);
+        break;
+
+    case CMD_RDPOS:                                     /* optional */
+        scsi_read_position (bus, data, len);
         break;
 
     case CMD_RELEASE:                                   /* mandatory */
