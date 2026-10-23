@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-21)
+## Fixes carried (reviewed 2026-10-23)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -55,6 +55,15 @@ Build it exactly as Open SIMH, for example:
 | SCSI: REASSIGN BLOCKS for disks (it was an unknown command) | `sim_scsi.c` | #638 (on #590) |
 | SCSI tape: transfers stay inside the bus buffer; I/O status and sense reported, a failed read is no data, an underlength record reports ILI and its residue | `sim_scsi.c` | #639 (on #590) |
 | SCSI: a failed host read or write is MEDIUM ERROR, not HARDWARE ERROR (OpenVMS retried 22 times and ran mount verification; now three retries and a read error) | `sim_scsi.c` | #637 (on #589) |
+| SCSI: clear the sense information field when a status is set (a tape read's residue reached the next, unrelated CHECK CONDITION) | `sim_scsi.c` | #644 |
+| SCSI tape: answer READ POSITION (34h), short form, instead of an unknown command | `sim_scsi.c` | #645 |
+| SCSI tape: an I/O error is MEDIUM ERROR, not HARDWARE ERROR | `sim_scsi.c` | #646 (on #639) |
+| SCSI tape: refuse the SPACE codes the unit does not implement (they answered GOOD and moved nothing) | `sim_scsi.c` | #647 |
+| SCSI tape: truncate an overlength record and leave the tape after it (it read nothing and left the tape in front of the record) | `sim_scsi.c` | #648 (on #639) |
+| VAX440: a SCSI DMA through an invalid map entry sets PAR_CTL<SCSI_MAP> and requests the SCSI interrupt, not the NI's | `VAX/vax440_sysdev.c` | #649 (on #625) |
+| VAX4XX: the 53C94 stops a DMA transfer the board did not complete (no terminal count, no completion interrupt) | `VAX/vax4xx_rz94.c`, `VAX/vax440_defs.h` | #632 (the KA49 effort's pull request, whose head carries this change) |
+| VAX4XX: DZ raises its transmit request when TRDY is set, once, and a TDR write clears TRDY (it was raised at every poll; NetBSD/vax panicked at `init`) | `VAX/vax4xx_dz.c` | #633 (the KA49 effort's, with our d4de843f) |
+| VAX440: SCCR keeps MOD, FONFUL and SPECIO as well as CENA | `VAX/vax440_sysdev.c` | #650 |
 
 ## Behaviour that differs from Open SIMH
 
