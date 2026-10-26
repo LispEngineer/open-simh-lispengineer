@@ -231,6 +231,8 @@ int32 sys_model = 0;                                    /* no graphics console *
 
 #define CEFSTS_W1C      0x0000001F                      /* <4:0> error bits */
 #define CEFSTS_IOREAD   0x0001920A                      /* fill of absent I/O space failed */
+#define CEFSTS_MEMREAD  0x0000020A                      /* fill of absent memory failed */
+#define CEFSTS_MEMWRITE 0x0000018A                      /* ... the ownership read of a write: <8> read done for a write, <7> O-read */
 #define CEFADR_IO       0xC0000000                      /* <31:30> set for I/O space */
 #define CEFADR_ALIGN    0xFFFFFFE0                      /* fill address: 32 bytes */
 
@@ -242,6 +244,8 @@ int32 sys_model = 0;                                    /* no graphics console *
 #define CESR_ERRSUM     0x80000000                      /* <31> error summary */
 #define CESR_CP2_MTT    0x00008000                      /* <15> CP2 master transaction timeout */
 #define MESR_ERRSUM     0x80000000                      /* NMC MESR <31> error summary */
+#define MESR_LOSTHARD   0x40000000                      /* <30> lost NDAL hard error */
+#define MESR_NXM        0x00100000                      /* <20> non-existent memory address */
 #define CIOEAR_ADDR     0x1FFFFFFF                      /* PA<28:0> */
 #define CIOEAR_ID1      0x20000000                      /* <31:29> = 1: the commander ID of a write with the Bcache on (a guess, see io_write_error) */
 #define IOERR_DELAY     5760                            /* us: 144000 NDAL cycles of 40 ns, the CP2 timeout (estimate; the hard error came within 10 ms) */
@@ -374,6 +378,7 @@ int32 ka_xipr44 = 0;                                    /* external IPR 44 (2100
 
 int32 nmc_memcon[8] = { 0 };                            /* MEMCON0-7 */
 int32 nmc_mesr = 0;                                     /* MESR */
+int32 nmc_mear = 0;                                     /* MEAR as latched by a memory error */
 int32 nmc_mmcdsr = 0;                                   /* MMCDSR */
 int32 nmc_moamr = 0;                                    /* MOAMR */
 uint32 nmc_last = 0;                                    /* last NMC register address, for MEAR */
@@ -426,6 +431,7 @@ REG sysd_reg[] = {
     { HRDATAD (DMADIR,  ka_dmadir,   1, "SCSI DMA direction") },
     { BRDATAD (MEMCON,  nmc_memcon, 16, 32, 8, "NMC memory configuration") },
     { HRDATAD (MESR,    nmc_mesr,   32, "NMC memory error status") },
+    { HRDATAD (MEAR,    nmc_mear,   32, "NMC memory error address, as latched by a memory error") },
     { HRDATAD (MMCDSR,  nmc_mmcdsr, 32, "NMC control, diagnostic and status") },
     { HRDATAD (MOAMR,   nmc_moamr,  32, "NMC O-bit RAM access mode") },
     { HRDATAD (CESR,    nca_cesr,   32, "NCA error status") },
@@ -759,12 +765,51 @@ if (pa < MEMSIZE)
 return NULL;
 }
 
+/* References above the top of memory.  A real 4000/90 (2026-10-26, a VMS
+   user-mode program at 08000000 on a 128 MB machine):
+
+   read     machine check 06; MESR 80100000 (<31> summary, <20>
+            non-existent memory), CEFSTS 0000020A, CEFADR the address, MEAR
+            the address plus 4 (02000001 for 08000000: PA<29:2> in <27:0>,
+            commander nibble 0; one entry in three read 02000006).  VMS
+            retries the instruction three times, each a machine check that
+            latches the same values again (VMS clears them in between).
+   write    posted, then the ownership read of the write miss fails: MESR
+            C0100000 (<30> lost NDAL hard error as well), CEFSTS 0000018A,
+            CCTL<31> (hardware error transition mode), MEAR the address plus
+            18 (02000006), and the hard error interrupt: VMS bugchecked
+            ASYNCWRTER.  Before the store's next instruction, so the program
+            did not get to print that it was done.
+
+   Everything is latched before the machine check, which does not return.
+   No lost-error bits are modelled. */
+
+static void mem_read_error (uint32 pa)
+{
+nmc_mesr = nmc_mesr | MESR_ERRSUM | MESR_NXM;
+nmc_mear = (int32) (((pa >> 2) + 1) & 0x0FFFFFFF);
+ka_cefsts = CEFSTS_MEMREAD;
+ka_cefadr = (int32) (pa & CEFADR_ALIGN);
+}
+
+static void mem_write_error (uint32 pa)
+{
+nmc_mesr = nmc_mesr | MESR_ERRSUM | MESR_LOSTHARD | MESR_NXM;
+nmc_mear = (int32) (((pa >> 2) + 6) & 0x0FFFFFFF);
+ka_cefsts = CEFSTS_MEMWRITE;
+ka_cefadr = (int32) (pa & CEFADR_ALIGN);
+ka_cctl = ka_cctl | CCTL_HWETM;
+ka_harderr = 1;
+SET_IRQL;
+}
+
 static int32 mem_rd (uint32 pa)
 {
 uint32 *wp = cdiag_word (pa);
 
 if (wp == NULL) {                                       /* no memory there */
     sim_debug (DBG_NXM, &sysd_dev, "read of non-existent memory %08X, PC %08X\n", pa, fault_PC);
+    mem_read_error (pa);
     MACH_CHECK (MCHK_READ);
     }
 if ((ka_cctl & CCTL_ENABLE) && (ka_cctl & CCTL_SWECC))
@@ -778,6 +823,7 @@ uint32 *wp = cdiag_word (pa);
 
 if (wp == NULL) {                                       /* no memory there */
     sim_debug (DBG_NXM, &sysd_dev, "write of non-existent memory %08X, PC %08X\n", pa, fault_PC);
+    mem_write_error (pa);
     return;
     }
 if (lnt == L_BYTE) {
@@ -1229,8 +1275,11 @@ switch (rg) {
         val = nmc_memcon[rg];
         break;
 
-    case 0x10:                                          /* MEAR */
-        val = (int32) (0x10000000 | ((nmc_last & 0x3FFFFFFF) >> 2));
+    case 0x10:                                          /* MEAR: the error address while a memory error is latched */
+        if (nmc_mesr & MESR_NXM)
+            val = nmc_mear;
+        else
+            val = (int32) (0x10000000 | ((nmc_last & 0x3FFFFFFF) >> 2));
         break;
 
     case 0x11:                                          /* MESR */
@@ -2032,6 +2081,7 @@ if (sim_switches & SWMASK ('P')) {                      /* power up */
     for (i = 0; i < 8; i++)
         nmc_memcon[i] = 0;
     nmc_mesr = 0;
+    nmc_mear = 0;
     nmc_mmcdsr = MMCDSR_INIT;
     nmc_moamr = 0;
     nca_cesr = 0;
