@@ -590,20 +590,69 @@ sim_activate (&rz->units[RZ_CTLR], 50);
 
    The chip's transfer counter decrements on a DMA acknowledge for data out
    and synchronous data in, and on the SCSI ACK for asynchronous data in
-   (so it can run ahead of a stopped engine by the 16 bytes of its FIFO)
    (NCR 53C94/95/96 data sheet, Transfer Counter register): a board that
    stops answering, as the KA46's does for a map entry with the valid bit
    clear, leaves the count short and the command unfinished.  The chip
    therefore sets no terminal count and raises no interrupt; the command
    stays where it is until software resets the chip (or the bus), as on
    the real part.  The board reports the failure to the CPU itself (on the
-   KA46, PAR_CTL<SCSI_MAP> and the SCSI interrupt).  A transfer of 16 bytes
-   or fewer that a real chip would finish into its FIFO stops here too. */
+   KA46, PAR_CTL<SCSI_MAP> and the SCSI interrupt).
+
+   An asynchronous data in is acknowledged into the chip's 16-byte FIFO
+   before the DMA engine drains it, so the count runs ahead of a stopped
+   engine by what the FIFO holds; rz_dma_refused() (below) takes that into
+   account.  Data out has no such slack: its count follows the engine. */
 
 void rz_dma_stopped (CTLR *rz, uint32 cmd, int32 nshort)
 {
 sim_debug (DBG_CMD, rz->dev, "DMA stopped, %d bytes not moved\n", nshort);
 rz->last_cmd = cmd;
+}
+
+/* The board's DMA engine took only some of the bytes of an asynchronous data in
+
+   The bytes were read from the bus (got), the engine stored got - nshort of
+   them.  The chip acknowledged the rest into its FIFO for as long as there
+   was room in it (16 bytes) and decremented its transfer counter for each,
+   so the counter ends nshort, or the room, whichever is less, below where
+   the engine left it, and the bytes wait in the FIFO, where the FIFO flags
+   count them and the microprocessor can read them out.
+
+   A transfer information command is complete when the counter is zero, the
+   FIFO is empty and the target asserts REQ for the next byte, or when the
+   target changes phase (data sheet, Transfer Information).  A FIFO that
+   holds bytes the engine did not take keeps the first from happening, so:
+
+     - the FIFO filled and bytes remain, or the counter is zero and the
+       target is still in the phase: the command waits for its DMA (terminal
+       count set if the counter is zero), no interrupt;
+     - the target changed phase (all it had to send was taken, by the
+       engine or the FIFO): the command ends as usual, with terminal count if
+       the counter is zero and the bus service interrupt, and the bytes still
+       in the FIFO.
+
+   Returns TRUE if the command goes on to end. */
+
+static t_bool rz_dma_refused (CTLR *rz, uint32 cmd, uint32 got, int32 nshort, uint32 old_phase)
+{
+uint32 moved = got - nshort;
+uint32 held = 16 - rz->fifo_c;
+uint32 i;
+
+if (held > (uint32) nshort)
+    held = nshort;
+for (i = 0; i < held; i++)
+    rz_fifo_wr (rz, rz->buf[moved + i]);
+rz->txc -= held;
+sim_debug (DBG_CMD, rz->dev, "DMA refused, %d bytes not moved, %d in the FIFO\n", nshort, held);
+if (((uint32) nshort > held) ||                         /* the FIFO is full and the target has more, */
+    ((rz->txc == 0) && (rz->bus.phase == old_phase))) { /* or it is not finished with the phase */
+    if (rz->txc == 0)
+        rz->stat |= STS_TC;
+    rz_dma_stopped (rz, cmd, nshort);
+    return FALSE;
+    }
+return TRUE;
 }
 
 void rz_cmd (CTLR *rz, uint32 cmd)
@@ -870,10 +919,9 @@ switch (cmd & 0x7f) {
                         nshort = RZ_DMA_WRITE (rz, txc, &rz->buf[0]);
                         RZ_DMA_DONE (rz, txc - nshort);
                         rz->txc -= txc - nshort;
-                        if (nshort != 0) {              /* board stopped the DMA */
-                            rz_dma_stopped (rz, cmd, nshort);
+                        if ((nshort != 0) &&            /* board stopped the DMA */
+                            !rz_dma_refused (rz, cmd, txc, nshort, old_phase))
                             return;
-                            }
                         }
                     if (rz->txc == 0)
                         rz->stat |= STS_TC;
