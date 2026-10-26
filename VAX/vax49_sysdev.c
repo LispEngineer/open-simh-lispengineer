@@ -241,7 +241,10 @@ int32 sys_model = 0;                                    /* no graphics console *
 
 #define CESR_ERRSUM     0x80000000                      /* <31> error summary */
 #define CESR_CP2_MTT    0x00008000                      /* <15> CP2 master transaction timeout */
+#define MESR_ERRSUM     0x80000000                      /* NMC MESR <31> error summary */
 #define CIOEAR_ADDR     0x1FFFFFFF                      /* PA<28:0> */
+#define CIOEAR_ID1      0x20000000                      /* <31:29> = 1: the commander ID of a write with the Bcache on (a guess, see io_write_error) */
+#define IOERR_DELAY     5760                            /* us: 144000 NDAL cycles of 40 ns, the CP2 timeout (estimate; the hard error came within 10 ms) */
 
 /* CCTL: Bcache control.  The bits the console's cache test uses, as the
    test shows them to behave:
@@ -393,7 +396,14 @@ const char *sysd_description (DEVICE *dptr);
 int32 con_halt (int32 code, int32 cc);
 void ka49_set_cdiag (void);
 
-UNIT sysd_unit = { UDATA (NULL, 0, 0) };
+t_stat io_write_svc (UNIT *uptr);
+
+UNIT sysd_unit[] = {
+    { UDATA (NULL, 0, 0) },
+    { UDATA (&io_write_svc, 0, 0) }                     /* a posted write that nothing answered */
+    };
+
+#define IOWR_UNIT       (&sysd_unit[1])
 
 REG sysd_reg[] = {
     { HRDATAD (SAVPC,   ka_savpc,   32, "console saved PC") },
@@ -433,8 +443,8 @@ MTAB sysd_mod[] = {
     };
 
 DEVICE sysd_dev = {
-    "SYSD", &sysd_unit, sysd_reg, sysd_mod,
-    1, 16, 16, 1, 16, 8,
+    "SYSD", sysd_unit, sysd_reg, sysd_mod,
+    2, 16, 16, 1, 16, 8,
     NULL, NULL, &sysd_reset,
     NULL, NULL, NULL,
     NULL, DEV_DEBUG, 0, sysd_debug, NULL, NULL, &sysd_help, NULL, NULL,
@@ -1186,6 +1196,21 @@ void obit_wr (int32 pa, int32 val, int32 lnt)
 nmc_obit[obit_index (pa)] = val & OBIT_MASK;
 }
 
+/* The hard error request (ERR_H, SCB 0x60 at IPL 1D) stays up while a
+   hard error is latched and unserved.  The vector acknowledge takes it
+   down (get_vector) and so does clearing the error: a real 4000/90's
+   console cleared the latch of a failed write with write-one-to-clear
+   stores and saw no ?33 UNXINT when it then lowered the IPL (2026-10-26).
+   Only writes raise it; a failed read is reported by its machine check. */
+
+static void hard_error_check (void)
+{
+if (((nca_cesr & CESR_ERRSUM) == 0) && ((nmc_mesr & MESR_ERRSUM) == 0)) {
+    ka_harderr = 0;
+    SET_IRQL;
+    }
+}
+
 /* NMC registers.  MEAR on a real 4000/90 read 18406010 with no error
    latched: (2101.8040 >> 2) with 1 in the top nibble, i.e. the address of
    the last NMC access (the read of MEAR itself), tagged with the commander
@@ -1249,6 +1274,7 @@ switch (rg) {
 
     case 0x11:                                          /* MESR: write 1 to clear */
         nmc_mesr = nmc_mesr & ~val;
+        hard_error_check ();
         break;
 
     case 0x12:                                          /* MMCDSR */
@@ -1311,6 +1337,7 @@ switch (rg) {
 
     case 0:                                             /* CESR: write 1 to clear */
         nca_cesr = nca_cesr & ~val;
+        hard_error_check ();
         break;
 
     case 1:                                             /* CMCDSR */
@@ -1749,8 +1776,44 @@ return ReadReg (pa & ~03, L_LONG);
 
    A write to an address that nothing answers is not a machine check on
    the NVAX (writes are posted); the hardware reports it later with a hard
-   error interrupt.  The model ignores such writes (to be revisited with
-   the error interrupts). */
+   error interrupt.
+
+   What a real 4000/90 did with a store to 3C000000 (2026-10-26): the
+   console's deposit and a VMS user-mode program's store both completed at
+   once and silently; some milliseconds later the NCA latched CESR <31,15>
+   (CP2 master transaction timeout) and CIOEAR2, raised the hard error and
+   VMS bugchecked (ASYNCWRTER) in the same 10 ms tick, after the program
+   had printed that it was done.  INTSYS read 0 at the console with the
+   error latched, so the request is not visible there (the model's INTSYS
+   is always 0).  CIOEAR2 read 3C000000 after the VMS write, PA<28:0> with
+   <29> set, where every read gave 1C000000, and the console's write left
+   1C000000: modelled as a function of the Bcache enable (CCTL<0>, set under
+   VMS, clear at the console), the one thing measured to differ.  That is a
+   guess; the alternative is that the console's write never updated
+   CIOEAR2.  A second write that is not answered while the first is
+   pending is not reported (no lost-error bits are modelled). */
+
+static void io_write_error (uint32 pa)
+{
+if (sim_is_active (IOWR_UNIT))
+    return;
+IOWR_UNIT->u3 = (int32) pa;
+sim_activate_after (IOWR_UNIT, IOERR_DELAY);
+}
+
+t_stat io_write_svc (UNIT *uptr)
+{
+uint32 pa = (uint32) uptr->u3;
+
+nca_cesr = nca_cesr | CESR_ERRSUM | CESR_CP2_MTT;
+nca_cioear2 = (int32) (pa & CIOEAR_ADDR);
+if (ka_cctl & CCTL_ENABLE)
+    nca_cioear2 = nca_cioear2 | CIOEAR_ID1;
+ka_harderr = 1;
+SET_IRQL;
+sim_debug (DBG_NXM, &sysd_dev, "hard error: write of non-existent address %08X, CESR %08X\n", pa, nca_cesr);
+return SCPE_OK;
+}
 
 void WriteReg (uint32 pa, int32 val, int32 lnt)
 {
@@ -1767,6 +1830,7 @@ for (p = &regtable[0]; p->low != 0; p++) {
         }
     }
 sim_debug (DBG_NXM, &sysd_dev, "write of non-existent address %08X = %08X, PC %08X\n", pa, val, fault_PC);
+io_write_error (pa);
 return;
 }
 
@@ -1978,6 +2042,7 @@ ka_cdiag = 0;
 ka49_set_cdiag ();
 ka_mchk_busy = 0;
 ka_softerr = ka_harderr = 0;
+sim_cancel (IOWR_UNIT);
 for (i = 0; i < IPL_HLVL; i++)
     int_req[i] = 0;
 int_mask = 0;
