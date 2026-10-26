@@ -59,7 +59,7 @@
       CSR's functions).  The console never reads the register.
 
    The adapter's other parts are the ones that option ROM's self-test uses
-   (learnings/m11-tca.md section 10; EK-KA490-SV Table 5-7 and A-20):
+   (EK-KA490-SV Table 5-7 and A-20):
 
    - the CSR at 3680.0000: bit 8 RESET, 11 TURBOchannel timeout, 12
      interrupt enable, 13 set by 11 with 12 (VMS: spurious), 9 map enable, 10 and 14
