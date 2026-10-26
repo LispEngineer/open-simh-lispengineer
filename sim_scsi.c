@@ -838,6 +838,7 @@ void scsi_read6_tape (SCSI_BUS *bus, uint8 *data, uint32 len)
 UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_seccnt sects, sectsread, new_buf_b;
+t_seccnt unread;                                        /* what a filemark leaves of the request */
 t_uint64 want;
 t_stat r;
 uint32 i, resid = 0;
@@ -848,6 +849,7 @@ if ((data[1] & 0x3) == 0x3) {                           /* SILI and FIXED? */
     }
 
 sects = GETW (data, 3) | (data[2] << 16);
+unread = sects;
 new_buf_b = 0;
 sectsread = 0;
 
@@ -876,6 +878,12 @@ if (uptr->flags & UNIT_ATT) {
                                sects, sectsread, r);
                 if (r == MTSE_OK) {
                     new_buf_b += SCSI_QIC_BLKSZ;
+                } else if (r == MTSE_TMK) {
+                    /* a filemark ends the read: the blocks before it are data (the tape is
+                       already past them) and the status below says how many were not read */
+                    unread = sects - i;
+                    sectsread = new_buf_b;
+                    break;
                 } else {
                     scsi_tape_status(bus, r);
                     scsi_status(bus, bus->status, bus->sense_key, bus->sense_code);
@@ -943,6 +951,8 @@ if (uptr->flags & UNIT_ATT) {
         scsi_status_deferred (bus, STS_CHK, (KEY_OK | KEY_M_ILI), ASC_OK);  /* but the length was wrong */
         bus->sense_info = resid;
         }
+    if (r == MTSE_TMK)                                  /* SCSI-2 10.2.4: a filemark: the requested length */
+        bus->sense_info = unread;                       /* less the blocks read (fixed), or the whole request */
     }
 else {                                                  /* no tape loaded */
     scsi_status (bus, STS_CHK, KEY_NOTRDY, ASC_NOMEDIA);
