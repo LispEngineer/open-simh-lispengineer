@@ -73,8 +73,8 @@
      page frame number, one entry per 512 bytes of TURBOchannel address;
    - slot 0 of the TURBOchannel at 3000.0000: a read that nothing answers
      (no module, or RESET asserted) sets CSR bit 11 and reads zero;
-   - the interrupt: INT_REQ bit 0 at IPL 15, vector 0144, a level that is the
-     CSR's bit 13.
+   - the interrupt: INT_REQ bit 0 at IPL 15, vector 0144, a level that is up
+     while CSR bit 12 is set and bit 11, an error bit or the module asks.
 
    Not known, and chosen to make the real ROM's tests pass (marked "guess"
    where used): how the diagnostic DMA address word maps to memory (the
