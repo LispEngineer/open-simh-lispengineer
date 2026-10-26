@@ -214,6 +214,35 @@ int32 sys_model = 0;                                    /* no graphics console *
 #define TBSTS_IDLE      0x800001D0
 #define NEOCMD_IDLE     0x0000FF14
 
+/* CEFSTS is one register, the Cbox's record of its last fill: <4:0> are the
+   error bits (<1> LOCK, <3> fill failed due to a read data error, <4> lost
+   error; write one to clear), the rest is state that the fill leaves behind
+   and that stays when the error bits are cleared.  A fill that fails
+   replaces the whole register, as a real 4000/90 showed (2026-10-26):
+
+        idle (VMS, nothing latched)     00006FA0
+        read of absent I/O space        0001920A, 00019200 once <4:0> are
+                                        cleared (the console's D/I AC 1F),
+                                        and still 00019200 under VMS later
+
+   CEFADR holds the address of the fill: for I/O space the physical
+   address, aligned to 32 bytes (alignment: a guess; 3C000000 and 3C000004
+   both gave it), with <31:30> set (FC000000 under VMS). */
+
+#define CEFSTS_W1C      0x0000001F                      /* <4:0> error bits */
+#define CEFSTS_IOREAD   0x0001920A                      /* fill of absent I/O space failed */
+#define CEFADR_IO       0xC0000000                      /* <31:30> set for I/O space */
+#define CEFADR_ALIGN    0xFFFFFFE0                      /* fill address: 32 bytes */
+
+/* NCA error status, CESR (2102.0000), the bits this model sets.  A read or
+   write that nothing answers on the CP2 bus is a master transaction
+   timeout: <15> with the summary <31>.  CIOEAR2 (2102.0014) holds the
+   address, PA<28:0>. */
+
+#define CESR_ERRSUM     0x80000000                      /* <31> error summary */
+#define CESR_CP2_MTT    0x00008000                      /* <15> CP2 master transaction timeout */
+#define CIOEAR_ADDR     0x1FFFFFFF                      /* PA<28:0> */
+
 /* CCTL: Bcache control.  The bits the console's cache test uses, as the
    test shows them to behave:
 
@@ -309,7 +338,9 @@ int32 ka_cctl = 0;                                      /* CCTL */
 int32 ka_bcdecc = 0;                                    /* BCDECC */
 int32 ka_bcedecc = 0;                                   /* BCEDECC */
 int32 ka_bcetsts = 0, ka_bcedsts = 0;                   /* Bcache error status */
-int32 ka_cefsts = 0, ka_nests = 0;                      /* Cbox fill and NDAL error status */
+int32 ka_cefsts = 0x00006FA0;                           /* Cbox fill status (the "90" idle value) */
+int32 ka_cefadr = 0;                                    /* Cbox fill error address */
+int32 ka_nests = 0;                                     /* NDAL error status */
 int32 ka_vmar = 0, ka_vtag = 0, ka_vdata = 0;           /* VIC diagnostic access */
 int32 ka_icsr = 0;                                      /* ICSR */
 int32 ka_bpcr = BPCR_INIT;                              /* BPCR */
@@ -349,6 +380,7 @@ uint32 *nmc_obit = NULL;                                /* O-bit RAM */
 
 int32 nca_cesr = 0;                                     /* CESR */
 int32 nca_cmcdsr = 0;                                   /* CMCDSR */
+int32 nca_cioear2 = 0;                                  /* CIOEAR2: CP2 I/O error address */
 
 /* SCSI scatter/gather map, as written */
 
@@ -387,6 +419,9 @@ REG sysd_reg[] = {
     { HRDATAD (MMCDSR,  nmc_mmcdsr, 32, "NMC control, diagnostic and status") },
     { HRDATAD (MOAMR,   nmc_moamr,  32, "NMC O-bit RAM access mode") },
     { HRDATAD (CESR,    nca_cesr,   32, "NCA error status") },
+    { HRDATAD (CIOEAR2, nca_cioear2, 32, "NCA CP2 I/O error address") },
+    { HRDATAD (CEFSTS,  ka_cefsts,  32, "Cbox fill error status") },
+    { HRDATAD (CEFADR,  ka_cefadr,  32, "Cbox fill error address") },
     { HRDATAD (CMCDSR,  nca_cmcdsr, 32, "NCA control, diagnostic and status") },
     { NULL }
     };
@@ -833,9 +868,13 @@ switch (rg) {
         break;
 
     case MT_BCETIDX: case MT_BCETAG: case MT_BCEDIDX:
-    case MT_CEFADR: case MT_NEOADR:
+    case MT_NEOADR:
     case MT_NEDATHI: case MT_NEDATLO:
         val = 0;
+        break;
+
+    case MT_CEFADR:                                     /* address of the last failed fill */
+        val = ka_cefadr;
         break;
 
     case MT_NEOCMD:                                     /* last NDAL commands */
@@ -847,7 +886,7 @@ switch (rg) {
         break;
 
     case MT_CEFSTS:
-        val = ka49_models[ka49_model].cefsts | ka_cefsts;
+        val = ka_cefsts;
         break;
 
     case MT_NESTS:
@@ -1027,8 +1066,8 @@ switch (rg) {
         ka_bcedsts = ka_bcedsts & ~val;
         break;
 
-    case MT_CEFSTS:
-        ka_cefsts = ka_cefsts & ~val;
+    case MT_CEFSTS:                                     /* <4:0> write one to clear */
+        ka_cefsts = ka_cefsts & ~(val & CEFSTS_W1C);
         break;
 
     case MT_NESTS:
@@ -1250,7 +1289,10 @@ switch (rg) {
     case 1:                                             /* CMCDSR */
         return nca_cmcdsr;
 
-    default:                                            /* error addresses: nothing latched */
+    case 5:                                             /* CIOEAR2 */
+        return nca_cioear2;
+
+    default:                                            /* the other error addresses: nothing latched */
         return 0;
         }
 }
@@ -1638,6 +1680,21 @@ struct reglink regtable[] = {
     { 0, 0, NULL, NULL }
     };
 
+/* What the board latches when a read of I/O space is not answered was
+   measured on a real 4000/90 (2026-10-26, a read of 3C000000 at the console
+   and from a VMS user-mode program): CESR <31> and <15> (CP2 master
+   transaction timeout), CIOEAR2 the address PA<28:0>, CEFSTS 0001920A and
+   CEFADR the fill address.  The read raises no hard error interrupt: the
+   machine check is the report. */
+
+static void io_read_error (uint32 pa)
+{
+nca_cesr = nca_cesr | CESR_ERRSUM | CESR_CP2_MTT;
+nca_cioear2 = (int32) (pa & CIOEAR_ADDR);
+ka_cefsts = CEFSTS_IOREAD;
+ka_cefadr = (int32) ((pa & CEFADR_ALIGN) | CEFADR_IO);
+}
+
 /* ReadReg - read register space
 
    Inputs:
@@ -1662,6 +1719,7 @@ for (p = &regtable[0]; p->low != 0; p++) {
         return p->read (pa);
     }
 sim_debug (DBG_NXM, &sysd_dev, "read of non-existent address %08X, PC %08X\n", pa, fault_PC);
+io_read_error (pa);                                     /* latch before the machine check: it does not return */
 MACH_CHECK (MCHK_READ);
 return 0;
 }
@@ -1904,6 +1962,8 @@ if (sim_switches & SWMASK ('P')) {                      /* power up */
     ka_bpcr = BPCR_INIT;
     ka_pamode = 0;
     ka_pcctl = 0;
+    ka_cefsts = ka49_models[ka49_model].cefsts;
+    ka_cefadr = 0;
     ka_led = 0;
     for (i = 0; i < 8; i++)
         nmc_memcon[i] = 0;
@@ -1912,6 +1972,7 @@ if (sim_switches & SWMASK ('P')) {                      /* power up */
     nmc_moamr = 0;
     nca_cesr = 0;
     nca_cmcdsr = CMCDSR_INIT;
+    nca_cioear2 = 0;
     }
 ka_cdiag = 0;
 ka49_set_cdiag ();
@@ -1973,6 +2034,7 @@ cptr = get_glyph (cptr, gbuf, 0);
 for (i = 0; ka49_models[i].name != NULL; i++) {
     if (strcmp (gbuf, ka49_models[i].name) == 0) {
         ka49_model = i;
+        ka_cefsts = ka49_models[i].cefsts;
         strcpy (sim_name, ka49_models[i].sim_name);
         return SCPE_OK;
         }
