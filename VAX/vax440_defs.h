@@ -112,6 +112,10 @@
 #define INITMEMSIZE     (1 << 24)                       /* initial memory size */
 #define MEMSIZE         (cpu_unit.capac)
 #define ADDR_IS_MEM(x)  (((uint32) (x)) < MEMSIZE)
+#if defined (VAX_46)
+extern uint32 cache2_cpu_memlimit;                      /* MEMSIZE, or 0 with the cache model on */
+#define ADDR_IS_MEM_CPU(x) (((uint32) (x)) < cache2_cpu_memlimit)
+#endif
 #if defined (VAX_46) || defined (VAX_47)
 #define MEM_MODIFIERS   { UNIT_MSIZE, (1u << 23), NULL, "8M", &cpu_set_size }, \
                         { UNIT_MSIZE, (1u << 24), NULL, "16M", &cpu_set_size }, \
