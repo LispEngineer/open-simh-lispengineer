@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-23)
+## Fixes carried (reviewed 2026-10-26)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -64,6 +64,10 @@ Build it exactly as Open SIMH, for example:
 | VAX4XX: the 53C94 stops a DMA transfer the board did not complete (no terminal count, no completion interrupt) | `VAX/vax4xx_rz94.c`, `VAX/vax440_defs.h` | #632 (the KA49 effort's pull request, whose head carries this change) |
 | VAX4XX: DZ raises its transmit request when TRDY is set, once, and a TDR write clears TRDY (it was raised at every poll; NetBSD/vax panicked at `init`) | `VAX/vax4xx_dz.c` | #633 (the KA49 effort's, with our d4de843f) |
 | VAX440: SCCR keeps MOD, FONFUL and SPECIO as well as CENA | `VAX/vax440_sysdev.c` | #650 |
+| SCSI tape: a READ that meets a filemark reports its residue in the sense Information field (the QIC fixed-block loop delivers the blocks before the mark, then the CHECK CONDITION) | `sim_scsi.c` | #653 (on #639) |
+| SCSI: a sense qualifier no longer outlives its CHECK CONDITION (a filemark's ASCQ reached the next, unrelated sense) | `sim_scsi.c` | #654 (on #644) |
+| VAX4XX: an asynchronous data-in of 16 bytes or fewer that the board does not take goes into the 53C94's FIFO (terminal count, no interrupt) | `VAX/vax4xx_rz94.c` | #632 (the KA49 effort's pull request, whose head e5793a0f carries this change) |
+| VAX440: a model of the KA46 secondary cache, `SET SYSD CACHE` (off by default; with it on the console's TEST 4 passes the CACHE test) | `VAX/vax440_sysdev.c`, `VAX/vax440_defs.h`, `VAX/vax_mmu.h` | #655 (on #611, #625) |
 
 ## Behaviour that differs from Open SIMH
 
