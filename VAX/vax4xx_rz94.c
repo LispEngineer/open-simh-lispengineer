@@ -569,14 +569,24 @@ rz_wr_c (rz_ctxmap[1], pa, data, access);
 }
 #endif
 
-/* Unit service routine */
+/* Unit service routine
+
+   The chip's INT output is its interrupt register being non-zero: there is
+   no interrupt without a cause in the register.  Every command queues one of
+   these events, and a command written while an earlier event is still queued
+   shares it (sim_activate leaves a queued event where it is).  If software
+   reads the register between the two, the later event finds the register
+   empty and must not raise the interrupt again, or the driver takes an
+   interrupt that has nothing to report. */
 
 t_stat rz_svc (UNIT *uptr)
 {
 CTLR *rz = rz_ctxmap[uptr->cnum];
 
-rz->stat |= STS_INT;
-RZ_SET_INT (rz);
+if (rz->intr != 0) {
+    rz->stat |= STS_INT;
+    RZ_SET_INT (rz);
+    }
 return SCPE_OK;
 }
 
@@ -860,16 +870,14 @@ switch (cmd & 0x7f) {
             rz->intr |= INT_DIS;                        /* disconnect */
             scsi_release (&rz->bus);
             }
+        else
+            rz->intr |= (INT_BUSSV | INT_FC);           /* selected */
         sim_activate (cuptr, 50);
         break;
 
     case 0x1A:                                          /* set ATN */
         sim_debug (DBG_CMD, rz->dev, "set atn\n");
-        scsi_set_atn (&rz->bus);
-        if (rz->bus.phase == 6) {                       /* TODO: check this */
-            rz->intr |= (INT_BUSSV | INT_FC);
-            sim_activate (cuptr, 50);
-            }
+        scsi_set_atn (&rz->bus);                        /* no interrupt (Am53CF94 data sheet) */
         break;
 
     case 0x1B:                                          /* reset ATN */
