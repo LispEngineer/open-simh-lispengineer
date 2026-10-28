@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-27)
+## Fixes carried (reviewed 2026-10-28)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -67,6 +67,7 @@ Build it exactly as Open SIMH, for example:
 | SCSI tape: a READ that meets a filemark reports its residue in the sense Information field (the QIC fixed-block loop delivers the blocks before the mark, then the CHECK CONDITION) | `sim_scsi.c` | #653 (on #639) |
 | SCSI: a sense qualifier no longer outlives its CHECK CONDITION (a filemark's ASCQ reached the next, unrelated sense) | `sim_scsi.c` | #654 (on #644) |
 | VAX4XX: an asynchronous data-in of 16 bytes or fewer that the board does not take goes into the 53C94's FIFO (terminal count, no interrupt) | `VAX/vax4xx_rz94.c` | #632 (the KA49 effort's pull request, whose head e5793a0f carries this change) |
+| VAX4XX: 53C94 Set ATN asserts ATN and raises no interrupt, the chip's interrupt is raised only while its interrupt register is non-zero (a stale service event no longer raises an interrupt that reads zero: the KA49's `UNEXPECTED INTERRUPT` / `SELECTION FAILED` port errors), and Select with ATN3 sets BUSSV and FC on success | `VAX/vax4xx_rz94.c` | #632 (the KA49 effort's pull request, fifth commit c8c4212b; TODO 213) |
 | VAX440: a model of the KA46 secondary cache, `SET SYSD CACHE` (off by default; with it on the console's TEST 4 passes the CACHE test) | `VAX/vax440_sysdev.c`, `VAX/vax440_defs.h`, `VAX/vax_mmu.h` | #655 (on #611, #625) |
 | The VAXstation 4000/90 (KA49, `vaxstation4000m90`; `SET CPU MODEL=90\|90A\|96`, up to 128 MB): the KA49 stack of Open SIMH #652 (system devices, SGEC, TCA, PMAZ, LCSPX video, 128 MB memory), its shared hunks (`ML_IPR_VALID` in `vax_cpu1.c`/`vax_defs.h`, defaulting to the old unsigned compare; a `VAX_49` case; makefile and CMake rows) and the three fixes after it (absent I/O latching, above-memory references latching MESR) | `VAX/vax49_sysdev.c` and the other new KA49 files, `VAX/vax_cpu1.c`, `VAX/vax_defs.h`, `makefile`, `VAX/CMakeLists.txt` | #652 (the KA49 effort's pull request; the three fixes after its head `d774b1f4` have no PR number yet) |
 | The KA49 console ROM (`VAX/ka49a.bin`) and its generator rows in `sim_BuildROMs.c` (`ka49a`, `lcspx`) | `VAX/ka49a.bin`, `sim_BuildROMs.c` | none: carried by this fork only, in no pull request (merge Open SIMH master into `integration` first and keep these two commits through it) |
