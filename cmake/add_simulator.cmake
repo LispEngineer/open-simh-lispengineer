@@ -409,6 +409,7 @@ if (NOT DONT_USE_ROMS)
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka46a_bin.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka47a_bin.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka48a_bin.h
+            ${CMAKE_SOURCE_DIR}/VAX/vax_ka49a_bin.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_is1000_bin.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka410_xs_bin.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka420_rdrz_bin.h
@@ -417,6 +418,7 @@ if (NOT DONT_USE_ROMS)
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka4xx_8pln_bin.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka4xx_dz_bin.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka4xx_spx_bin.h
+            ${CMAKE_SOURCE_DIR}/VAX/vax_lcspx_bin.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka750_bin_new.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_ka750_bin_old.h
             ${CMAKE_SOURCE_DIR}/VAX/vax_vcb02_bin.h
