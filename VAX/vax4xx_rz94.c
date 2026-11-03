@@ -159,6 +159,7 @@ typedef struct {
     SCSI_BUS bus;                                       /* SCSI bus state */
     DEVICE *dev;                                        /* the controller's device */
     UNIT *units;                                        /* its units: targets, then the chip's events */
+    uint8 io_intr;                                      /* interrupt held for an outstanding disk transfer */
     } CTLR;
 
 /* debugging bitmaps */
@@ -596,6 +597,30 @@ rz->intr |= flag;
 sim_activate (&rz->units[RZ_CTLR], 50);
 }
 
+/* The target asks for the next phase after a disk transfer (sim_scsi.c)
+
+   A command whose bytes started a disk Read or Write -- a selection with
+   the command in the FIFO, or a transfer information or transfer pad that
+   ended the data out -- ends when the target asserts REQ in the next phase
+   (data sheet, Select and Transfer Information), and that is when the host
+   has completed the transfer.  Until then the command's interrupt is held
+   here, the status register shows the phase the target holds, and the
+   interrupt register is empty. */
+
+static void rz_io_done (SCSI_BUS *bus)
+{
+uint32 i;
+
+for (i = 0; i < RZ_CTLRS; i++) {
+    CTLR *rz = rz_ctxmap[i];
+
+    if ((&rz->bus == bus) && (rz->io_intr != 0)) {
+        rz_setint (rz, rz->io_intr);
+        rz->io_intr = 0;
+        }
+    }
+}
+
 /* The board's DMA engine moved fewer bytes than the chip asked for
 
    The chip's transfer counter decrements on a DMA acknowledge for data out
@@ -713,7 +738,8 @@ switch (cmd & 0x7f) {
 
     case 3:                                         /* reset SCSI */
         sim_debug (DBG_CMD, rz->dev, "SCSI reset\n");
-        scsi_reset (&rz->bus);
+        scsi_reset (&rz->bus);                          /* (waits for a disk transfer) */
+        rz->io_intr = 0;
         if ((rz->cfg1 & CFG1_SRD) == 0) {
             rz_setint (rz, INT_SCSIRST);
             }
@@ -793,7 +819,10 @@ switch (cmd & 0x7f) {
             }
         else {
             rz->seq = 4;
-            rz->intr |= (INT_BUSSV | INT_FC);
+            if (scsi_io_pending (&rz->bus))             /* the command started a disk transfer? */
+                rz->io_intr = (INT_BUSSV | INT_FC);     /* when the target asks for the next phase */
+            else
+                rz->intr |= (INT_BUSSV | INT_FC);
             }
         sim_activate (cuptr, 50);
         break;
@@ -824,7 +853,10 @@ switch (cmd & 0x7f) {
             }
         else {
             rz->seq = 4;
-            rz->intr |= (INT_BUSSV | INT_FC);
+            if (scsi_io_pending (&rz->bus))             /* the command started a disk transfer? */
+                rz->io_intr = (INT_BUSSV | INT_FC);     /* when the target asks for the next phase */
+            else
+                rz->intr |= (INT_BUSSV | INT_FC);
             }
         sim_activate (cuptr, 50);
         break;
@@ -944,6 +976,8 @@ switch (cmd & 0x7f) {
         if (scsi_state (&rz->bus, tgt) == SCSI_DISC) {
             rz->intr |= INT_DIS;
             }
+        else if (scsi_io_pending (&rz->bus))            /* the data out started a disk transfer? */
+            rz->io_intr = INT_BUSSV;                    /* when the target asks for the next phase */
         else {
             if (rz->bus.req)
                 rz->intr |= INT_BUSSV;
@@ -987,7 +1021,7 @@ switch (cmd & 0x7f) {
                 if (rz->bus.phase == 6)
                     scsi_release_atn (&rz->bus);
                 rz->buf[0] = 0;
-                for (; ((rz->bus.phase == old_phase) && (rz->txc > 0)); rz->txc--)
+                for (; ((rz->bus.phase == old_phase) && !scsi_io_pending (&rz->bus) && (rz->txc > 0)); rz->txc--)
                     scsi_write (&rz->bus, &rz->buf[0], 1);
                 if (rz->txc == 0)
                     rz->stat |= STS_TC;
@@ -1005,6 +1039,8 @@ switch (cmd & 0x7f) {
         rz->seq = 0;
         if (scsi_state (&rz->bus, tgt) == SCSI_DISC)
             rz->intr |= INT_DIS;
+        else if (scsi_io_pending (&rz->bus))            /* the pad started a disk transfer? */
+            rz->io_intr = (INT_BUSSV | INT_FC);         /* when the target asks for the next phase */
         else {
             if (rz->bus.req)
                 rz->intr |= INT_BUSSV;
@@ -1038,7 +1074,8 @@ rz->intr = 0;
 rz->dest = 0;
 rz_fifo_reset (rz);
 RZ_CLR_INT (rz);
-scsi_reset (&rz->bus);
+scsi_reset (&rz->bus);                                  /* (waits for a disk transfer) */
+rz->io_intr = 0;
 }
 
 t_stat rz_reset (DEVICE *dptr)
@@ -1061,6 +1098,7 @@ if (rz->buf == NULL)
 r = scsi_init (&rz->bus, RZ_MAXFR);                     /* init SCSI bus */
 if (r != SCPE_OK)
     return r;
+scsi_set_async (&rz->bus, &rz_io_done);                 /* disk transfers off the instruction thread */
 rz->bus.dptr = dptr;                                    /* set bus device */
 for (i = 0; i < 8; i++) {
     uptr = dptr->units + i;

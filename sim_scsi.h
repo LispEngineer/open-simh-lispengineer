@@ -109,10 +109,18 @@ struct scsi_bus_t {
     uint32 sense_code;
     uint32 sense_qual;
     uint32 sense_info;
+    void (*io_done)(struct scsi_bus_t *bus);            /* asynchronous disk transfers: the target */
+                                                        /* asks for the next phase (NULL: synchronous) */
+    UNIT *io_unit;                                      /* unit with a disk transfer outstanding */
+    t_seccnt io_sects;                                  /* sectors it transferred */
+    t_bool io_write;                                    /* it is a write */
+    t_bool io_starting;                                 /* it is being started */
+    t_bool io_abandon;                                  /* the bus was reset or released meanwhile */
 };
 
 typedef struct scsi_bus_t SCSI_BUS;
 typedef struct scsi_dev_t SCSI_DEV;
+typedef void (*SCSI_IO_DONE)(SCSI_BUS *bus);
 
 t_bool scsi_arbitrate (SCSI_BUS *bus, uint32 initiator);
 void scsi_release (SCSI_BUS *bus);
@@ -128,6 +136,8 @@ void scsi_reset_unit (UNIT *uptr);
 void scsi_reset (SCSI_BUS *bus);
 t_stat scsi_init (SCSI_BUS *bus, uint32 maxfr);
 t_bool scsi_xfer_too_big (SCSI_BUS *bus, uint32 bytes);
+t_stat scsi_set_async (SCSI_BUS *bus, SCSI_IO_DONE io_done);
+t_bool scsi_io_pending (SCSI_BUS *bus);
 
 t_stat scsi_set_fmt (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
 t_stat scsi_set_wlk (UNIT *uptr, int32 val, CONST char *cptr, void *desc);

@@ -128,6 +128,8 @@ static const char *scsi_phases[] = {
     "MSGI"                                              /* message in */
     };
 
+static void scsi_io_abandon (SCSI_BUS *bus);
+
 /* Arbitrate for control of the bus */
 
 t_bool scsi_arbitrate (SCSI_BUS *bus, uint32 initiator)
@@ -149,6 +151,7 @@ void scsi_release (SCSI_BUS *bus)
 {
 if (bus->initiator < 0)                                 /* already free? */
     return;
+scsi_io_abandon (bus);
 sim_debug (SCSI_DBG_BUS, bus->dptr,
    "Initiator %d released bus\n", bus->initiator);
 bus->phase = SCSI_DATO;                                 /* bus free state */
@@ -390,6 +393,159 @@ sim_debug (SCSI_DBG_CMD, bus->dptr,
     "transfer of %u bytes exceeds the %u byte buffer\n", bytes, bus->buf_size);
 scsi_status (bus, STS_CHK, KEY_ILLREQ, ASC_INVCDB);
 return TRUE;
+}
+
+/* Asynchronous disk transfers
+
+   A disk Read or Write runs on the simulator's instruction thread unless the
+   controller asks for it to run on the unit's I/O thread (sim_disk's
+   asynchronous interface).  A synchronous transfer stops the whole simulator
+   -- CPU, clock and every other device -- until the host has completed it:
+   on a container opened for raw access (O_DSYNC) that is until the data is
+   on the host's storage, milliseconds each time and seconds when the host's
+   storage is busy.
+
+   On a bus whose controller has called scsi_set_async(), a disk Read(6),
+   Read(10), Write(6) or Write(10) is started on the I/O thread and the
+   simulator goes on: the target holds the bus with REQ deasserted, as a drive
+   does while it seeks or writes, and takes and offers no bytes.  When the
+   host has completed the transfer the data in or status phase follows with
+   REQ asserted, as it would have at once, and the controller's io_done
+   routine is called (on the instruction thread) so that it can tell the
+   initiator that the target asks for the next phase.  The durability of a
+   write is unchanged: its status is sent when the host has completed it.
+
+   A bus reset or a release of the bus while a transfer is outstanding waits
+   for the host to complete it and then forgets it; nothing is sent for it.
+   A stop at the simulator's prompt completes every outstanding transfer
+   (sim_disk's I/O flush), so nothing is outstanding while SCP commands run.
+   With asynchronous I/O unavailable or disabled (SET NOASYNCH), sim_disk
+   completes the transfer before it returns and the phase follows at once. */
+
+#define SCSI_ASYNC_BUSES 8
+
+static SCSI_BUS *scsi_async_bus[SCSI_ASYNC_BUSES];      /* the buses that asked */
+
+t_stat scsi_set_async (SCSI_BUS *bus, SCSI_IO_DONE io_done)
+{
+uint32 i, slot = SCSI_ASYNC_BUSES;
+
+for (i = 0; i < SCSI_ASYNC_BUSES; i++) {
+    if (scsi_async_bus[i] == bus) {                     /* already known */
+        slot = i;
+        break;
+        }
+    if ((scsi_async_bus[i] == NULL) && (slot == SCSI_ASYNC_BUSES))
+        slot = i;
+    }
+if (io_done == NULL) {                                  /* back to synchronous */
+    if ((slot < SCSI_ASYNC_BUSES) && (scsi_async_bus[slot] == bus))
+        scsi_async_bus[slot] = NULL;
+    bus->io_done = NULL;
+    return SCPE_OK;
+    }
+if (slot == SCSI_ASYNC_BUSES)                           /* no room: stay synchronous */
+    return SCPE_NOFNC;
+scsi_async_bus[slot] = bus;
+bus->io_done = io_done;
+return SCPE_OK;
+}
+
+/* Is a disk transfer outstanding on the bus? */
+
+t_bool scsi_io_pending (SCSI_BUS *bus)
+{
+return (bus->io_unit != NULL);
+}
+
+/* The end of a disk Read or Write: the data in phase, or the status */
+
+static void scsi_disk_end (SCSI_BUS *bus, t_stat r)
+{
+UNIT *uptr = bus->dev[bus->target];
+SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
+
+if (bus->io_write) {
+    memset (&bus->cmd[0], 0, 10);
+    if (r != SCPE_OK)                                   /* write failed? */
+        scsi_status (bus, STS_CHK, KEY_MEDERR, ASC_WRTERR);
+    else
+        scsi_status (bus, STS_OK, KEY_OK, ASC_OK);
+    return;
+    }
+if (r != SCPE_OK) {                                     /* read failed? */
+    scsi_status (bus, STS_CHK, KEY_MEDERR, ASC_UNRERR);
+    return;
+    }
+bus->buf_b = (bus->io_sects * dev->block_size);
+scsi_set_phase (bus, SCSI_DATI);                        /* data in phase next */
+scsi_set_req (bus);                                     /* request to send data */
+}
+
+/* Completion of a disk transfer started by scsi_disk_xfer (sim_disk callback) */
+
+static void scsi_disk_io_done (UNIT *uptr, t_stat r)
+{
+SCSI_BUS *bus = NULL;
+uint32 i;
+
+for (i = 0; i < SCSI_ASYNC_BUSES; i++) {
+    if ((scsi_async_bus[i] != NULL) && (scsi_async_bus[i]->io_unit == uptr))
+        bus = scsi_async_bus[i];
+    }
+if (bus == NULL)                                        /* forgotten: nothing to do */
+    return;
+bus->io_unit = NULL;
+if (bus->io_abandon) {                                  /* reset or released meanwhile? */
+    sim_debug (SCSI_DBG_BUS, bus->dptr, "Abandoned disk transfer complete\n");
+    return;
+    }
+if (!bus->io_starting)
+    sim_debug (SCSI_DBG_BUS, bus->dptr, "Disk transfer complete, status %d\n", r);
+scsi_disk_end (bus, r);
+if (!bus->io_starting)                                  /* completed after it was started? */
+    bus->io_done (bus);                                 /* tell the controller */
+}
+
+/* Read or write sects sectors at lba between the selected unit and the bus buffer */
+
+static void scsi_disk_xfer (SCSI_BUS *bus, t_bool write, t_lba lba, t_seccnt sects)
+{
+UNIT *uptr = bus->dev[bus->target];
+t_stat r;
+
+bus->io_write = write;
+bus->io_sects = 0;
+if (bus->io_done == NULL) {                             /* synchronous bus? */
+    if (write)
+        r = sim_disk_wrsect (uptr, lba, &bus->buf[0], &bus->io_sects, sects);
+    else
+        r = sim_disk_rdsect (uptr, lba, &bus->buf[0], &bus->io_sects, sects);
+    scsi_disk_end (bus, r);
+    return;
+    }
+bus->io_unit = uptr;
+bus->io_abandon = FALSE;
+bus->io_starting = TRUE;                                /* a completion now is not news to the controller */
+if (write)
+    sim_disk_wrsect_a (uptr, lba, &bus->buf[0], &bus->io_sects, sects, &scsi_disk_io_done);
+else
+    sim_disk_rdsect_a (uptr, lba, &bus->buf[0], &bus->io_sects, sects, &scsi_disk_io_done);
+bus->io_starting = FALSE;
+if (bus->io_unit != NULL)
+    sim_debug (SCSI_DBG_BUS, bus->dptr, "Disk transfer outstanding\n");
+}
+
+/* Abandon an outstanding disk transfer: wait for the host to complete it, then forget it */
+
+static void scsi_io_abandon (SCSI_BUS *bus)
+{
+if (bus->io_unit == NULL)
+    return;
+sim_debug (SCSI_DBG_BUS, bus->dptr, "Waiting for the outstanding disk transfer\n");
+bus->io_abandon = TRUE;
+sim_cancel (bus->io_unit);                              /* waits for it and runs its completion */
+bus->io_unit = NULL;
 }
 
 /* Command - Test Unit Ready */
@@ -804,7 +960,6 @@ UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_lba lba;
 t_seccnt sects, sectsread;
-t_stat r;
 
 lba = GETW (data, 2) | ((data[1] & 0x1F) << 16);
 sects = data[4];
@@ -817,11 +972,8 @@ if (scsi_xfer_too_big (bus, sects * dev->block_size))
     return;
 
 if (uptr->flags & UNIT_ATT) {
-    r = sim_disk_rdsect (uptr, lba, &bus->buf[0], &sectsread, sects);
-    if (r != SCPE_OK) {                                 /* read failed? */
-        scsi_status (bus, STS_CHK, KEY_MEDERR, ASC_UNRERR);
-        return;
-        }
+    scsi_disk_xfer (bus, FALSE, lba, sects);            /* data in or status, now or later */
+    return;
     }
 else {
     memset (&bus->buf[0], 0, (sects * dev->block_size));
@@ -949,7 +1101,6 @@ UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_lba lba;
 t_seccnt sects, sectsread;
-t_stat r;
 
 lba = GETL (data, 2);
 sects = GETW (data, 7);
@@ -965,11 +1116,8 @@ if (scsi_xfer_too_big (bus, sects * dev->block_size))
     return;
 
 if (uptr->flags & UNIT_ATT) {
-    r = sim_disk_rdsect (uptr, lba, &bus->buf[0], &sectsread, sects);
-    if (r != SCPE_OK) {                                 /* read failed? */
-        scsi_status (bus, STS_CHK, KEY_MEDERR, ASC_UNRERR);
-        return;
-        }
+    scsi_disk_xfer (bus, FALSE, lba, sects);            /* data in or status, now or later */
+    return;
     }
 else {
     memset (&bus->buf[0], 0, (sects * dev->block_size));
@@ -1024,8 +1172,7 @@ void scsi_write6_disk (SCSI_BUS *bus, uint8 *data, uint32 len)
 UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_lba lba;
-t_seccnt sects, sectswritten;
-t_stat r;
+t_seccnt sects;
 
 if (bus->phase == SCSI_CMD) {
     scsi_debug_cmd (bus, "Write(6) - CMD\n");
@@ -1049,12 +1196,8 @@ else if (bus->phase == SCSI_DATO) {
     scsi_debug_cmd (bus, "Write(6) - DATO, lba %d bytes %d\n", lba, sects);
 
     if (uptr->flags & UNIT_ATT) {
-        r = sim_disk_wrsect (uptr, lba, &bus->buf[0], &sectswritten, sects);
-        if (r != SCPE_OK) {                             /* write failed? */
-            memset (&bus->cmd[0], 0, 10);
-            scsi_status (bus, STS_CHK, KEY_MEDERR, ASC_WRTERR);
-            return;
-            }
+        scsi_disk_xfer (bus, TRUE, lba, sects);         /* status, now or later */
+        return;
         }
 
     memset (&bus->cmd[0], 0, 10);
@@ -1107,8 +1250,7 @@ void scsi_write10_disk (SCSI_BUS *bus, uint8 *data, uint32 len)
 UNIT *uptr = bus->dev[bus->target];
 SCSI_DEV *dev = (SCSI_DEV *)uptr->up7;
 t_lba lba;
-t_seccnt sects, sectswritten;
-t_stat r;
+t_seccnt sects;
 
 if (bus->phase == SCSI_CMD) {
     scsi_debug_cmd (bus, "Write(10) - CMD\n");
@@ -1134,12 +1276,8 @@ else if (bus->phase == SCSI_DATO) {
     scsi_debug_cmd (bus, "Write(10) - DATO, lba %d bytes %d\n", lba, sects);
 
     if (uptr->flags & UNIT_ATT) {
-        r = sim_disk_wrsect (uptr, lba, &bus->buf[0], &sectswritten, sects);
-        if (r != SCPE_OK) {                             /* write failed? */
-            memset (&bus->cmd[0], 0, 10);
-            scsi_status (bus, STS_CHK, KEY_MEDERR, ASC_WRTERR);
-            return;
-            }
+        scsi_disk_xfer (bus, TRUE, lba, sects);         /* status, now or later */
+        return;
         }
 
     memset (&bus->cmd[0], 0, 10);
@@ -1624,6 +1762,8 @@ uint32 left = len;
 uint32 bc;
 uint8 *buf;
 
+if (bus->io_unit != NULL)                               /* target busy with a disk transfer: */
+    return 0;                                           /* it takes nothing */
 scsi_release_req (bus);                                 /* assume done */
 for (buf = data; left > 0; buf += bc, left -= bc) {
     switch (bus->phase) {
@@ -1663,6 +1803,8 @@ uint32 scsi_read (SCSI_BUS *bus, uint8 *data, uint32 len)
 {
 uint32 i;
 
+if (bus->io_unit != NULL)                               /* target busy with a disk transfer: */
+    return 0;                                           /* it offers nothing */
 if (len == 0) {
     *data = bus->buf[bus->buf_t];
     return 0;
@@ -1750,6 +1892,7 @@ switch (dev->devtype) {
 
 void scsi_reset (SCSI_BUS *bus)
 {
+scsi_io_abandon (bus);
 sim_debug (SCSI_DBG_BUS, bus->dptr, "Bus reset\n");
 bus->phase = SCSI_DATO;
 bus->buf_t = bus->buf_b = 0;
