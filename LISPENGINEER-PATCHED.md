@@ -11,7 +11,7 @@ Build it exactly as Open SIMH, for example:
     git clone -b lispengineer-patched https://github.com/LispEngineer/open-simh-lispengineer.git
     make -C open-simh-lispengineer vaxstation4000m60 microvax3900
 
-## Fixes carried (reviewed 2026-10-28)
+## Fixes carried (reviewed 2026-11-04)
 
 | Fix | Files | Open SIMH PR |
 | :-- | :-- | :-- |
@@ -71,6 +71,10 @@ Build it exactly as Open SIMH, for example:
 | VAX440: a model of the KA46 secondary cache, `SET SYSD CACHE` (off by default; with it on the console's TEST 4 passes the CACHE test) | `VAX/vax440_sysdev.c`, `VAX/vax440_defs.h`, `VAX/vax_mmu.h` | #655 (on #611, #625) |
 | The VAXstation 4000/90 (KA49, `vaxstation4000m90`; `SET CPU MODEL=90\|90A\|96`, up to 128 MB): the KA49 stack of Open SIMH #652 (system devices, SGEC, TCA, PMAZ, LCSPX video, 128 MB memory), its shared hunks (`ML_IPR_VALID` in `vax_cpu1.c`/`vax_defs.h`, defaulting to the old unsigned compare; a `VAX_49` case; makefile and CMake rows) and the three fixes after it (absent I/O latching, above-memory references latching MESR) | `VAX/vax49_sysdev.c` and the other new KA49 files, `VAX/vax_cpu1.c`, `VAX/vax_defs.h`, `makefile`, `VAX/CMakeLists.txt` | #652 (the KA49 effort's pull request; the three fixes after its head `d774b1f4` have no PR number yet) |
 | The KA49 console ROM (`VAX/ka49a.bin`) and its generator rows in `sim_BuildROMs.c` (`ka49a`, `lcspx`) | `VAX/ka49a.bin`, `sim_BuildROMs.c` | none: carried by this fork only, in no pull request (merge Open SIMH master into `integration` first and keep these two commits through it) |
+| VAX4XX: SAVE and RESTORE carry the 53C94's registers, FIFO and SCSI bus state and the bus's data buffer (a save grows by 0.5 MB per controller; the registers are hidden, `EXAMINE RZ ALL` is unchanged). Before, a restored simulator came back with a power-up chip (its own bus ID 0, the first disk never selected) and a read in flight finished with zeros. **A running OpenVMS guest now restores on the KA49 (`vaxstation4000m90`), including a save taken with the SCSI bus in data-in or in data-out (a write between its CDB and its data). It still does not on the KA46, KA47 or KA48 (VAXstation 4000/60, MicroVAX 3100/80, VLC): their board state -- interrupt request and mask, memory configuration, cache registers -- is not saved either (TODO 229); this change makes it no worse.** | `VAX/vax4xx_rz94.c` | #632 (the KA49 effort's pull request, whose head 1fc6e8bd carries these two commits) |
+| VAX49: SAVE and RESTORE carry the SCSI scatter/gather map (a static array, hidden register `SGMAP`; 64 KB in a save). A save between the driver loading the map and starting the transfer restored an empty map and the read ended in mount verification | `VAX/vax49_sysdev.c` | #636 (the KA49 effort's) |
+| VAX49: machine check code 06 (a failed read of memory above the top or of absent I/O) sets the frame's VR bit, ISTATE2<7>, as the real 4000/90's frames have it; OpenVMS then retries the read up to three times in 180 seconds and the error log gets the entries the real machine logged | `VAX/vax49_sysdev.c` | #636 (the KA49 effort's) |
+| CMake: the KA49 and LCSPX ROM headers named among BuildROMs' outputs (no target consumes the list: no build changes) | `cmake/add_simulator.cmake` | none yet |
 
 ## Behaviour that differs from Open SIMH
 
