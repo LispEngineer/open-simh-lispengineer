@@ -194,6 +194,7 @@ REG sysd_reg[] = {
     { HRDATAD (MAPBASE, ka_mapbase, 32, "KA460 DMA map base") },
     { HRDATAD (LED,     ka_led,     16, "KA460 diag display") },
     { HRDATAD (PARCTL,  ka_parctl,  32, "KA460 parity control") },
+    { HRDATAD (INTMASK, int_mask,    8, "KA460 interrupt mask"), REG_HIDDEN },
 #if defined (VAX_46)
     { DRDATAD (CFILLS,  cache2_fills,  64, "cache model: lines filled by a read miss") },
     { DRDATAD (CHITS,   cache2_hits,   64, "cache model: reads served from the data store") },
