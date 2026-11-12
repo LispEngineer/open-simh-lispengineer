@@ -200,6 +200,7 @@ REG sysd_reg[] = {
     { DRDATAD (CHITS,   cache2_hits,   64, "cache model: reads served from the data store") },
     { DRDATAD (CWHITS,  cache2_whits,  64, "cache model: writes that updated a line") },
     { DRDATAD (CINVALS, cache2_invals, 64, "cache model: lines invalidated by a DMA write or a deposit") },
+    { HRDATAD (SCCR,    SCCR,       32, "KA460 secondary cache control"), REG_HIDDEN },
 #endif
     { NULL }
     };
